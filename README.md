@@ -141,31 +141,31 @@ Sumeru implements a unified-memory columnar pipeline: writes commit in two phase
 - **3-level cached lock-free schedule**: Read/write bitsets statically resolve conflicts at build time (L1), while pre-bound column slots (L2) and 32–64KB cache slices (L3) dispatch work with zero runtime locks.
 - **Zero-copy heterogeneous dispatch**: The same contiguous column buffers feed multi-core CPU SIMD slices, map zero-copy into GPU unified memory (Metal UMA / wgpu), or export as Apache Arrow `RecordBatch`es.
 
-## Features
+## Features & Roadmap
 
 **Storage & Schema**
-- [x] 16KB page-aligned contiguous columns and copy-on-write blocks
-- [x] Generational row indexing and flat column pointer cache
-- [x] Relational pairs, zero-sized tags, and global singletons
-- [x] Two-phase atomic batch commits with per-row patch folding
+- [x] **Unified-Memory Page-Aligned Columnar Store**: 16KB hardware page-aligned contiguous columns with block-level copy-on-write (CoW), generational row indexing, and flat column pointer caches for zero-copy CPU SIMD and GPU co-processing
+- [x] **Relational ECS & In-Place State Bit-Planes**: Native archetype tables, `(Relation, Target)` entity pairs, zero-sized tags, global singletons, and 8-way non-migrating row bit-planes that eliminate table migration on high-frequency state toggles
+- [x] **Two-Phase Deterministic Atomic Commit**: Pre-validated batch transactions with per-row patch folding and structural topology batching, avoiding runtime lock contention and per-row commit overhead
+- [ ] **Prototype Inheritance & Parameterized Prefabs (`IsA` Hierarchy)**: Hierarchical component sharing and copy-on-write overrides via `IsA` relations for zero-redundancy entity instantiation
 
 **Query & Filtering**
-- [x] Inverted column-to-table bitmaps and incremental query caching
-- [x] Level-2 pre-bound column slots and multi-column row cursors
-- [x] 64-bit hardware word bitmask jump filtering, contiguous run coalescing, and target bitmap indexing
-- [x] 8-way non-migrating row bit-planes and 64-row chunk dirty tracking
-- [x] Standalone stateless primitives and bitmap indexing library
+- [x] **Multi-Level Cached Compiled Query Engine**: Inverted column-to-table bitmaps with incremental topology caching (L1), pre-bound column slots (L2), and multi-column row cursors that reduce runtime matching to $O(1)$ sequential scans
+- [x] **Word-Aligned Bitmask Filtering & Dirty Epochs**: Standalone stateless bitmap primitives, 64-bit word jump filtering, contiguous run coalescing, relational target bitmaps, and 64-row dirty epochs for incremental fixed-point evaluation
+- [ ] **Transitive Graph Queries & Worst-Case Optimal Joins (WCOJ)**: Relational transitive closure derivation, hierarchy traversal caches, and multi-hop graph join operators
+- [ ] **Vectorized Columnar Analytics & Spatial Indexing**: Native SIMD vectorized aggregations, group-by analytics, and spatial proximity indexing pushed down directly onto contiguous column chunks
 
 **Schedule & Heterogeneous Compute**
-- [x] Multi-core parallel chunk iteration and zero-copy slice borrowing
-- [x] L1/L2 cache-conscious adaptive subchunk planner
-- [x] Static dependency graph (DAG) scheduler, 3-level caching, and static ambiguity detection
-- [x] 16KB hardware page dirty bitmap folding, typed Shader IR, and GPU zero-copy compute pass
+- [x] **Static Disjoint-Access Parallel DAG Scheduler**: Compile/build-time read/write bitset conflict resolution and static ambiguity detection with lock-free topological wave dispatch
+- [x] **Cache-Conscious Morsel-Driven Parallelism**: Adaptive L1/L2 cache-resident subchunk planner (32–64KB) paired with work-stealing zero-copy slice borrowing for high-throughput SIMD iteration
+- [x] **Zero-Bubble Multi-Kernel GPU Compute Pass**: Rust AST to typed Shader IR compilation pipeline (with Naga static validation and dead-write elimination), 16KB hardware page dirty bitmap folding, and explicit memory barriers within a single command buffer
+- [ ] **Cross-Platform GPU Backends & Hybrid CPU-GPU DAG Orchestration**: Unified heterogeneous backends across Metal, Vulkan, DirectX 12, and WebGPU with automated CPU-GPU pipeline scheduling and JIT kernel compilation
 
 **Snapshots & Ecosystem**
-- [x] Zero-copy Apache Arrow `RecordBatch` bridge
-- [x] Whole-column zero-copy snapshots and deterministic time-travel
-- [x] Frame commit receipts and column-pruned delta replay
+- [x] **Zero-Copy Time-Travel Snapshots & Column-Pruned Replay**: Whole-column zero-copy `rkyv` archives, frame commit receipts, and column-pruned delta replay for sub-millisecond deterministic state rollback
+- [x] **Zero-Copy Apache Arrow Bridge**: In-situ export of physical columns into Apache Arrow `RecordBatch`es without memory reallocation or serialization
+- [ ] **Streaming Columnar Exchange & Lakehouse Interop**: Zero-copy streaming I/O for Apache Arrow Flight, Parquet, and random-access columnar formats (Vortex / Lance)
+- [ ] **Cross-Language Zero-Copy ABI & WebAssembly Runtime**: Standard C-ABI, zero-copy Python / C++ bindings via the Arrow C Data Interface, and portable WebAssembly / WebGPU execution
 
 ## License
 
