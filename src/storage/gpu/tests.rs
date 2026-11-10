@@ -1,6 +1,11 @@
 //! 16KB 硬件页对齐 GPU 零拷贝、Naga 着色器编译校验与三层遍历体系单元测试 (M0 ~ M5)
 
 use crate::storage::column::page_aligned::{PageAlignedBuffer, HARDWARE_PAGE_SIZE};
+use crate::storage::gpu::{
+    distance, dot, length, normalize, vec2, vec3, vec4, GpuAssignOp, GpuBinaryOp, GpuBlock,
+    GpuComponentSchema, GpuExpr, GpuKernelBindingSpec, GpuKernelDescriptor, GpuLit, GpuLValue,
+    GpuMathIntrinsic, GpuScalarKind, GpuStmt, GpuValueType, GpuVectorExt,
+};
 use crate::storage::gpu::metal::compile_and_validate_pipeline;
 use crate::{
     gpu, gpu_component, gpu_kernel, EntityId, GpuKernel, GpuShaderStruct, LayoutOptimization,
@@ -46,7 +51,7 @@ pub fn integrate_weighted_motion(pos: &mut SimPosition, vel: &SimVelocity, mass:
 #[gpu]
 pub fn clamp_and_early_return(pos: &mut SimPosition, vel: &SimVelocity) {
     let mut step_x: f32 = vel.vx.abs().clamp(0.0, 10.0);
-    let scale = (2i32 as f32) * 0.5;
+    let scale = 2.0_f32 * 0.5;
     step_x *= scale;
     pos.x += step_x;
     if pos.x > 100.0 {
@@ -61,6 +66,7 @@ pub struct LegacyAttrPoint {
     pub py: f32,
 }
 
+#[allow(dead_code)]
 #[gpu_kernel(LegacyPointStepKernel)]
 pub fn step_legacy_point(pt: &mut LegacyAttrPoint) {
     pt.px += 1.0;
@@ -869,8 +875,8 @@ fn m6_runtime_gpu_detection_driver_dispatch_and_morsel_par() {
             desc: &MetalNoCopyBufferDescriptor,
         ) -> Result<(), crate::StateError> {
             assert!(
-                (desc.base_ptr as usize) % HARDWARE_PAGE_SIZE == 0
-                    && desc.allocated_bytes % HARDWARE_PAGE_SIZE == 0,
+                (desc.base_ptr as usize).is_multiple_of(HARDWARE_PAGE_SIZE)
+                    && desc.allocated_bytes.is_multiple_of(HARDWARE_PAGE_SIZE),
                 "Hardware driver must only receive 16KB page-aligned zero-copy buffers"
             );
             self.state
@@ -1177,7 +1183,7 @@ fn m6_runtime_gpu_detection_driver_dispatch_and_morsel_par() {
 
     let epoch_before_bundle = cloned_store.epoch();
     let mut bundle = crate::EntityBundle::new();
-    bundle.insert(SimPosition { x: 5.0, y: 6.0 });
+    bundle.insert(SimPosition { x: 5.0, y: 6.0 }).unwrap();
     cloned_store
         .create_entity(EntityId::from_u128(999_002), bundle)
         .unwrap();
@@ -1540,6 +1546,1187 @@ fn m8_typed_shader_ir_external_consts_and_composable_helpers() {
     assert_eq!(s_gpu, s_cpu);
     assert_eq!(s_gpu.pos, [6.0, 1.0, 0.0]);
 }
+
+#[gpu]
+pub struct SimDrag {
+    pub coeff: f32,
+}
+
+#[gpu]
+pub struct SimArchetypeMarkerA {
+    pub tag: u32,
+}
+
+#[gpu]
+pub struct SimArchetypeMarkerB {
+    pub tag: u32,
+}
+
+#[gpu]
+pub fn helper_add_vec3_in_place(dst: &mut [f32; 3], delta: [f32; 3]) {
+    dst[0] += delta[0];
+    dst[1] += delta[1];
+    dst[2] += delta[2];
+}
+
+#[gpu]
+pub fn helper_translate_state_with_drag(
+    state: &mut SimVec3State,
+    vel: &SimVelocity,
+    drag: &SimDrag,
+    dt: f32,
+) {
+    let factor = 1.0 - drag.coeff * dt;
+    let delta: [f32; 3] = [vel.vx * dt * factor, vel.vy * dt * factor, 1.5];
+    helper_add_vec3_in_place(&mut state.pos, delta);
+}
+
+#[gpu]
+pub fn integrate_single_uniform(pos: &mut SimPosition, vel: &SimVelocity, dt: f32) {
+    pos.x += vel.vx * dt;
+    pos.y += vel.vy * dt;
+}
+
+#[gpu]
+pub fn integrate_5comp_with_uniforms_and_helpers(
+    pos: &mut SimPosition,
+    vel: &SimVelocity,
+    state: &mut SimVec3State,
+    mass: &SimMass,
+    drag: &SimDrag,
+    dt: f32,
+    step_inc: u32,
+) {
+    // 1. Bidirectional u32 literal coercion in assignment, comparison, bitwise, shift, and min/max
+    state.mask[0] += 1;
+    state.mask[0] += step_inc;
+    state.mask[1] = 3;
+    if state.mask[0] > 0 && (state.mask[1] & 3) == 3 {
+        state.mask[1] = (state.mask[1] << 1) | 1;
+    }
+    let capped_mask = state.mask[0].min(100);
+    state.mask[0] = capped_mask;
+
+    // 2. Composable void helper taking `&mut SimVec3State`, `&SimVelocity`, `&SimDrag`, and `dt: f32`
+    helper_translate_state_with_drag(state, vel, drag, dt);
+
+    // 3. Local array repeat `[val; N]` + `loop { ... break; }`
+    let mut bonus: [f32; 3] = [0.5; 3];
+    let mut iter_count = 0;
+    loop {
+        bonus[0] += 0.25;
+        iter_count += 1;
+        if iter_count >= 2 {
+            break;
+        }
+    }
+    pos.x += vel.vx * mass.inv_mass * dt + bonus[0];
+    pos.y += vel.vy * mass.inv_mass * dt + bonus[1];
+}
+
+#[test]
+fn m9_dynamic_uniforms_bidirectional_u32_struct_helpers_and_batch_dispatch() {
+    use crate::QueryBuilder;
+
+    // 1. Validate shader generation & Naga WGSL/MSL compilation for 5-component + 2-uniform kernel
+    let bound = integrate_5comp_with_uniforms_and_helpers.with_args((0.5f32, 2u32));
+    let desc = bound.descriptor();
+    let wgsl = desc.wgsl_source();
+    let msl = desc.msl_source();
+
+    assert!(
+        wgsl.contains("state.mask[0] += 1u;"),
+        "Bidirectional u32 inference must suffix `1` in `state.mask[0] += 1`: {wgsl}"
+    );
+    assert!(
+        wgsl.contains("min(state.mask[0], 100u)"),
+        "Bidirectional u32 inference must suffix `100` in `min(state.mask[0], 100)`: {wgsl}"
+    );
+    assert!(
+        wgsl.contains("let dt: f32 = bitcast<f32>(uniforms.scalar_arg_0);"),
+        "Dynamic f32 scalar uniform must be unpacked via bitcast<f32>: {wgsl}"
+    );
+    assert!(
+        wgsl.contains("let step_inc: u32 = uniforms.scalar_arg_1;"),
+        "Dynamic u32 scalar uniform must be unpacked from scalar_arg_1: {wgsl}"
+    );
+    assert!(
+        msl.contains("const float dt = as_type<float>(uniforms.scalar_arg_0);"),
+        "MSL dynamic f32 scalar uniform must be unpacked via as_type<float>: {msl}"
+    );
+
+    let compiled = compile_and_validate_pipeline(desc)
+        .expect("5-component + 2-uniform + struct/array-ref helper kernel must pass Naga validation");
+    assert!(compiled.shader_validated);
+
+    // Also validate single-uniform kernel ergonomics (`with_args(0.25f32)` without tuple)
+    let single_bound = integrate_single_uniform.with_args(0.25f32);
+    let single_compiled = compile_and_validate_pipeline(single_bound.descriptor())
+        .expect("Single scalar uniform kernel must pass Naga validation");
+    assert!(single_compiled.shader_validated);
+
+    // 2. Test 5-tuple RegisterGpuQuery and populate 3 distinct Archetypes to verify
+    //    single-MTLCommandBuffer multi-archetype batch dispatch
+    let mut store_hw = Store::new();
+    store_hw
+        .register_gpu_query::<(
+            &mut SimPosition,
+            &SimVelocity,
+            &mut SimVec3State,
+            &SimMass,
+            &SimDrag,
+        )>()
+        .unwrap();
+
+    let base_comps = (
+        SimPosition { x: 1.0, y: 2.0 },
+        SimVelocity { vx: 4.0, vy: 8.0 },
+        SimVec3State {
+            pos: [10.0, 20.0, 30.0],
+            vel: [1.0, 2.0, 3.0],
+            mask: [4, 0],
+            steps: 1,
+        },
+        SimMass { inv_mass: 0.5 },
+        SimDrag { coeff: 0.2 },
+    );
+
+    // Archetype 1: exact 5 components (16 entities)
+    for i in 0..16u128 {
+        store_hw
+            .insert((EntityId::from_u128(100 + i), base_comps))
+            .unwrap();
+    }
+    // Archetype 2: 5 components + SimArchetypeMarkerA (16 entities)
+    for i in 0..16u128 {
+        store_hw
+            .insert((
+                EntityId::from_u128(200 + i),
+                (
+                    base_comps.0,
+                    base_comps.1,
+                    base_comps.2,
+                    base_comps.3,
+                    base_comps.4,
+                    SimArchetypeMarkerA { tag: 1 },
+                ),
+            ))
+            .unwrap();
+    }
+    // Archetype 3: 5 components + SimArchetypeMarkerB (16 entities)
+    for i in 0..16u128 {
+        store_hw
+            .insert((
+                EntityId::from_u128(300 + i),
+                (
+                    base_comps.0,
+                    base_comps.1,
+                    base_comps.2,
+                    base_comps.3,
+                    base_comps.4,
+                    SimArchetypeMarkerB { tag: 2 },
+                ),
+            ))
+            .unwrap();
+    }
+
+    let mut store_cpu_fallback = store_hw.clone();
+    let mut store_seq = store_hw.clone();
+    let mut store_par = store_hw.clone();
+    let mut store_persistent = store_hw.clone();
+
+    let mut hw_engine = MetalComputeEngine::new();
+    let mut cpu_engine = MetalComputeEngine::new_cpu_fallback();
+
+    type Q5<'a> = (
+        &'a mut SimPosition,
+        &'a SimVelocity,
+        &'a mut SimVec3State,
+        &'a SimMass,
+        &'a SimDrag,
+    );
+
+    // Hardware GPU batch dispatch across 3 archetypes
+    let stats_hw = store_hw
+        .query_mut::<Q5>()
+        .unwrap()
+        .gpu()
+        .for_each_on(
+            &mut hw_engine,
+            integrate_5comp_with_uniforms_and_helpers.with_args((0.5f32, 2u32)),
+        )
+        .unwrap();
+    assert_eq!(stats_hw.dispatched_archetypes, 3);
+    assert_eq!(stats_hw.total_rows, 48);
+    if hw_engine.has_hardware_gpu() {
+        assert_eq!(
+            stats_hw.command_buffer_submissions, 1,
+            "Multi-archetype GPU dispatch must encode all 3 archetypes into a single MTLCommandBuffer submission"
+        );
+    } else {
+        assert_eq!(stats_hw.command_buffer_submissions, 0);
+    }
+
+    // CPU Fallback engine batch dispatch
+    let stats_cpu = store_cpu_fallback
+        .query_mut::<Q5>()
+        .unwrap()
+        .gpu()
+        .for_each_on(
+            &mut cpu_engine,
+            integrate_5comp_with_uniforms_and_helpers.with_args((0.5f32, 2u32)),
+        )
+        .unwrap();
+    assert_eq!(stats_cpu.dispatched_archetypes, 3);
+    assert_eq!(stats_cpu.total_rows, 48);
+    assert_eq!(stats_cpu.command_buffer_submissions, 0);
+
+    // CPU sequential `.run(...)` with bound dynamic uniform args
+    store_seq
+        .query_mut::<Q5>()
+        .unwrap()
+        .run(integrate_5comp_with_uniforms_and_helpers.with_args((0.5f32, 2u32)));
+
+    // CPU parallel `.par_run(...)` with bound dynamic uniform args
+    store_par
+        .query_mut::<Q5>()
+        .unwrap()
+        .par_run(integrate_5comp_with_uniforms_and_helpers.with_args((0.5f32, 2u32)));
+
+    // Persistent `Query::gpu_for_each_on` across 3 archetypes
+    let q_persistent = QueryBuilder::<Q5<'static>>::new()
+        .build(&store_persistent)
+        .unwrap();
+    let stats_persistent = q_persistent
+        .gpu_for_each_on(
+            &mut store_persistent,
+            &mut hw_engine,
+            integrate_5comp_with_uniforms_and_helpers.with_args((0.5f32, 2u32)),
+        )
+        .unwrap();
+    assert_eq!(stats_persistent.dispatched_archetypes, 3);
+    assert_eq!(stats_persistent.total_rows, 48);
+    if hw_engine.has_hardware_gpu() {
+        assert_eq!(stats_persistent.command_buffer_submissions, 1);
+    }
+
+    // Verify all 48 entities across all 3 archetypes match identically across all 5 execution paths
+    // Expected values for dt=0.5, step_inc=2:
+    // - state.mask[0]: 4 + 1 + 2 = 7
+    // - state.mask[1]: (3 << 1) | 1 = 7
+    // - factor = 1.0 - 0.2 * 0.5 = 0.9
+    // - delta = [4.0 * 0.5 * 0.9, 8.0 * 0.5 * 0.9, 1.5] = [1.8, 3.6, 1.5]
+    // - state.pos = [11.8, 23.6, 31.5]
+    // - bonus = [0.5 + 0.25*2, 0.5, 0.5] = [1.0, 0.5, 0.5]
+    // - pos.x = 1.0 + 4.0 * 0.5 * 0.5 + 1.0 = 3.0
+    // - pos.y = 2.0 + 8.0 * 0.5 * 0.5 + 0.5 = 4.5
+    for prefix in [100u128, 200, 300] {
+        for i in 0..16u128 {
+            let e = EntityId::from_u128(prefix + i);
+            let p_hw = *store_hw.get::<SimPosition>(e).unwrap();
+            let p_cpu = *store_cpu_fallback.get::<SimPosition>(e).unwrap();
+            let p_seq = *store_seq.get::<SimPosition>(e).unwrap();
+            let p_par = *store_par.get::<SimPosition>(e).unwrap();
+            let p_per = *store_persistent.get::<SimPosition>(e).unwrap();
+            assert_eq!(p_hw, p_cpu);
+            assert_eq!(p_hw, p_seq);
+            assert_eq!(p_hw, p_par);
+            assert_eq!(p_hw, p_per);
+            assert!((p_hw.x - 3.0).abs() < 1e-5 && (p_hw.y - 4.5).abs() < 1e-5);
+
+            let s_hw = *store_hw.get::<SimVec3State>(e).unwrap();
+            let s_cpu = *store_cpu_fallback.get::<SimVec3State>(e).unwrap();
+            let s_seq = *store_seq.get::<SimVec3State>(e).unwrap();
+            let s_par = *store_par.get::<SimVec3State>(e).unwrap();
+            let s_per = *store_persistent.get::<SimVec3State>(e).unwrap();
+            assert_eq!(s_hw, s_cpu);
+            assert_eq!(s_hw, s_seq);
+            assert_eq!(s_hw, s_par);
+            assert_eq!(s_hw, s_per);
+            assert_eq!(s_hw.mask, [7, 7]);
+            assert!((s_hw.pos[0] - 11.8).abs() < 1e-5);
+            assert!((s_hw.pos[1] - 23.6).abs() < 1e-5);
+            assert!((s_hw.pos[2] - 31.5).abs() < 1e-5);
+        }
+    }
+}
+
+#[test]
+fn m10_gpu_compute_pass_multi_kernel_bubble_elimination() {
+    let mut engine = MetalComputeEngine::new();
+    let has_gpu = engine.has_hardware_gpu();
+
+    let mut store = Store::new().with_layout_optimization(LayoutOptimization::PageAlignedGpu);
+    store
+        .register_gpu_query::<(&mut SimPosition, &SimVelocity)>()
+        .unwrap();
+
+    let old_epoch = store.epoch();
+    const NUM_ENTITIES: usize = 256;
+    for i in 0..NUM_ENTITIES {
+        store
+            .insert((
+                EntityId::from_u128(i as u128 + 1),
+                (
+                    SimPosition { x: 10.0, y: 20.0 },
+                    SimVelocity { vx: 4.0, vy: 6.0 },
+                ),
+            ))
+            .unwrap();
+    }
+
+    // 开启 GpuComputePass：连续调度多 Kernel 并插入显存屏障，单次 commit + wait 消除气泡
+    let mut pass = store.gpu_compute_pass(&mut engine).unwrap();
+    assert_eq!(pass.dispatches(), 0);
+
+    // Kernel 1: 积分位置 (pos += vel) -> pos 变为 (14.0, 26.0)
+    pass.dispatch(integrate_sim_motion).unwrap();
+    assert_eq!(pass.dispatches(), 1);
+
+    // 显存屏障: 确保 Kernel 1 的写操作对后续 Kernel 可见
+    pass.barrier().unwrap();
+
+    // Kernel 2: 速度阻尼 (vel *= 0.5) -> vel 变为 (2.0, 3.0)
+    pass.dispatch(damp_velocity).unwrap();
+    assert_eq!(pass.dispatches(), 2);
+
+    // 显存屏障
+    pass.barrier().unwrap();
+
+    // Kernel 3: 再次积分位置 (pos += vel) -> pos 变为 (16.0, 29.0)
+    pass.dispatch(integrate_sim_motion).unwrap();
+    assert_eq!(pass.dispatches(), 3);
+
+    // 提交命令缓冲区并统一等待完成，批量推进写纪元与脏页位图
+    let stats = pass.finish().unwrap();
+
+    if has_gpu {
+        // 多 Kernel 在单个命令缓冲区中统一提交，仅产生 1 次 hardware command buffer submission！
+        assert_eq!(stats.command_buffer_submissions, 1);
+    }
+    assert_eq!(stats.dispatched_archetypes, 3);
+    assert_eq!(stats.total_rows, NUM_ENTITIES * 3);
+
+    // 校验 Store 全局纪元已推进
+    assert!(store.epoch() > old_epoch);
+
+    // 校验数据执行结果正确性
+    for i in 0..NUM_ENTITIES {
+        let e = EntityId::from_u128(i as u128 + 1);
+        let pos = *store.get::<SimPosition>(e).unwrap();
+        let vel = *store.get::<SimVelocity>(e).unwrap();
+        assert!((pos.x - 16.0).abs() < 1e-5, "pos.x was {}", pos.x);
+        assert!((pos.y - 29.0).abs() < 1e-5, "pos.y was {}", pos.y);
+        assert!((vel.vx - 2.0).abs() < 1e-5, "vel.vx was {}", vel.vx);
+        assert!((vel.vy - 3.0).abs() < 1e-5, "vel.vy was {}", vel.vy);
+    }
+
+    // 校验 CPU 脏页位图已感知到 GPU 批量写回
+    let pos_views = store.gpu_column_views::<SimPosition>(old_epoch).unwrap();
+    assert!(!pos_views.is_empty());
+    assert!(pos_views[0].1.dirty_bitmap().dirty_page_count() > 0);
+
+    let vel_views = store.gpu_column_views::<SimVelocity>(old_epoch).unwrap();
+    assert!(!vel_views.is_empty());
+    assert!(vel_views[0].1.dirty_bitmap().dirty_page_count() > 0);
+}
+
+#[test]
+fn m10_gpu_compute_pass_cpu_fallback_and_backward_compatibility() {
+    let mut fallback_engine = MetalComputeEngine::new_cpu_fallback();
+    assert_eq!(fallback_engine.execution_mode(), crate::GpuExecutionMode::CpuFallback);
+
+    let mut store = Store::new().with_layout_optimization(LayoutOptimization::PageAlignedGpu);
+    store
+        .register_gpu_query::<(&mut SimPosition, &SimVelocity)>()
+        .unwrap();
+
+    const NUM_ENTITIES: usize = 64;
+    for i in 0..NUM_ENTITIES {
+        store
+            .insert((
+                EntityId::from_u128(i as u128 + 1),
+                (
+                    SimPosition { x: 0.0, y: 0.0 },
+                    SimVelocity { vx: 1.0, vy: 2.0 },
+                ),
+            ))
+            .unwrap();
+    }
+
+    // 测试链式调用与 execute 别名
+    let mut pass = store.gpu_compute_pass(&mut fallback_engine).unwrap();
+    pass.for_each(integrate_sim_motion)
+        .unwrap()
+        .barrier()
+        .unwrap()
+        .for_each(damp_velocity)
+        .unwrap();
+    pass.execute().unwrap();
+
+    for i in 0..NUM_ENTITIES {
+        let e = EntityId::from_u128(i as u128 + 1);
+        let pos = *store.get::<SimPosition>(e).unwrap();
+        let vel = *store.get::<SimVelocity>(e).unwrap();
+        assert!((pos.x - 1.0).abs() < 1e-5);
+        assert!((pos.y - 2.0).abs() < 1e-5);
+        assert!((vel.vx - 0.5).abs() < 1e-5);
+        assert!((vel.vy - 1.0).abs() < 1e-5);
+    }
+
+    // 验证既有单 Query .gpu().for_each(...) API 保持 100% 向后兼容
+    let stats = store
+        .query_mut::<(&mut SimPosition, &SimVelocity)>()
+        .unwrap()
+        .gpu()
+        .for_each_on(&mut fallback_engine, integrate_sim_motion)
+        .unwrap();
+    assert_eq!(stats.total_rows, NUM_ENTITIES);
+
+    for i in 0..NUM_ENTITIES {
+        let e = EntityId::from_u128(i as u128 + 1);
+        let pos = *store.get::<SimPosition>(e).unwrap();
+        assert!((pos.x - 1.5).abs() < 1e-5);
+        assert!((pos.y - 3.0).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn m10_gpu_compute_pass_encode_query_with_filters() {
+    let mut engine = MetalComputeEngine::new();
+
+    let mut store = Store::new().with_layout_optimization(LayoutOptimization::PageAlignedGpu);
+    store
+        .register_gpu_query::<(&mut SimPosition, &SimVelocity, &SimMass)>()
+        .unwrap();
+
+    // Archetype 1: 带 SimMass (inv_mass: 2.0)
+    for i in 0..32u128 {
+        store
+            .insert((
+                EntityId::from_u128(100 + i),
+                (
+                    SimPosition { x: 0.0, y: 0.0 },
+                    SimVelocity { vx: 2.0, vy: 3.0 },
+                    SimMass { inv_mass: 2.0 },
+                ),
+            ))
+            .unwrap();
+    }
+
+    // Archetype 2: 不带 SimMass
+    for i in 0..32u128 {
+        store
+            .insert((
+                EntityId::from_u128(200 + i),
+                (
+                    SimPosition { x: 0.0, y: 0.0 },
+                    SimVelocity { vx: 2.0, vy: 3.0 },
+                ),
+            ))
+            .unwrap();
+    }
+
+    // 构造预编译长期 Query 并添加原型级过滤：仅匹配带 SimMass 的表
+    let query_with_mass = crate::storage::query::QueryBuilder::<(&'static mut SimPosition, &'static SimVelocity)>::new()
+        .with::<SimMass>()
+        .build(&store)
+        .unwrap();
+
+    let mut pass = store.gpu_compute_pass(&mut engine).unwrap();
+    pass.encode_query(&query_with_mass, integrate_sim_motion).unwrap();
+    let stats = pass.finish().unwrap();
+
+    // 仅 32 行匹配并分派，不带 SimMass 的 32 行未被分派
+    assert_eq!(stats.total_rows, 32);
+
+    for i in 0..32u128 {
+        let e_with = EntityId::from_u128(100 + i);
+        let pos_with = *store.get::<SimPosition>(e_with).unwrap();
+        assert!((pos_with.x - 2.0).abs() < 1e-5);
+        assert!((pos_with.y - 3.0).abs() < 1e-5);
+
+        let e_without = EntityId::from_u128(200 + i);
+        let pos_without = *store.get::<SimPosition>(e_without).unwrap();
+        assert_eq!(pos_without.x, 0.0);
+        assert_eq!(pos_without.y, 0.0);
+    }
+}
+
+#[gpu]
+pub struct SimVecParticle {
+    pub pos: [f32; 3],
+    pub vel: [f32; 3],
+    pub speed: f32,
+}
+
+#[gpu]
+pub fn update_vec_particle_m11(p: &mut SimVecParticle, mass: &SimMass) {
+    if p.speed < 0.0 {
+        return;
+    }
+    let v = vec3(p.vel[0], p.vel[1], p.vel[2]);
+    let len = length(v);
+    let dir = v.normalize();
+    let dist = v.distance(vec3(0.0, 0.0, 0.0));
+    let d = dir.dot(v);
+    p.speed = len * mass.inv_mass + (dist - d) * 0.0;
+    p.pos[0] += dir[0] * p.speed;
+    p.pos[1] += dir[1] * p.speed;
+    p.pos[2] += dir[2] * p.speed;
+}
+
+#[gpu]
+pub fn read_only_inspector_kernel(p: &mut SimPosition, vel: &SimVelocity) {
+    let _s = vel.vx + p.x;
+    if p.x > 50.0 {
+        return;
+    }
+}
+
+#[test]
+fn m11_shader_vector_ir_and_naga_validation() {
+    let block = GpuBlock {
+        stmts: vec![
+            GpuStmt::Let {
+                name: "v1",
+                mutable: false,
+                explicit_ty: Some(GpuValueType::Vector(GpuScalarKind::F32, 3)),
+                init: GpuExpr::vec3(
+                    GpuExpr::Lit(GpuLit::F32(1.0)),
+                    GpuExpr::Lit(GpuLit::F32(2.0)),
+                    GpuExpr::Lit(GpuLit::F32(3.0)),
+                ),
+            },
+            GpuStmt::Let {
+                name: "v2",
+                mutable: false,
+                explicit_ty: Some(GpuValueType::Vector(GpuScalarKind::F32, 3)),
+                init: GpuExpr::vec3(
+                    GpuExpr::Lit(GpuLit::F32(4.0)),
+                    GpuExpr::Lit(GpuLit::F32(5.0)),
+                    GpuExpr::Lit(GpuLit::F32(6.0)),
+                ),
+            },
+            GpuStmt::Let {
+                name: "v_add",
+                mutable: false,
+                explicit_ty: None,
+                init: GpuExpr::Binary {
+                    op: GpuBinaryOp::Add,
+                    lhs: Box::new(GpuExpr::Var("v1")),
+                    rhs: Box::new(GpuExpr::Var("v2")),
+                },
+            },
+            GpuStmt::Let {
+                name: "v_sub",
+                mutable: false,
+                explicit_ty: None,
+                init: GpuExpr::Binary {
+                    op: GpuBinaryOp::Sub,
+                    lhs: Box::new(GpuExpr::Var("v2")),
+                    rhs: Box::new(GpuExpr::Var("v1")),
+                },
+            },
+            GpuStmt::Let {
+                name: "v_mul",
+                mutable: false,
+                explicit_ty: None,
+                init: GpuExpr::Binary {
+                    op: GpuBinaryOp::Mul,
+                    lhs: Box::new(GpuExpr::Var("v_add")),
+                    rhs: Box::new(GpuExpr::Lit(GpuLit::F32(0.5))),
+                },
+            },
+            GpuStmt::Let {
+                name: "d",
+                mutable: false,
+                explicit_ty: None,
+                init: GpuExpr::MathCall {
+                    receiver: Box::new(GpuExpr::Var("v1")),
+                    intrinsic: GpuMathIntrinsic::Dot,
+                    args: vec![GpuExpr::Var("v2")],
+                },
+            },
+            GpuStmt::Let {
+                name: "len",
+                mutable: false,
+                explicit_ty: None,
+                init: GpuExpr::MathCall {
+                    receiver: Box::new(GpuExpr::Var("v_mul")),
+                    intrinsic: GpuMathIntrinsic::Length,
+                    args: vec![],
+                },
+            },
+            GpuStmt::Let {
+                name: "norm",
+                mutable: false,
+                explicit_ty: None,
+                init: GpuExpr::MathCall {
+                    receiver: Box::new(GpuExpr::Var("v1")),
+                    intrinsic: GpuMathIntrinsic::Normalize,
+                    args: vec![],
+                },
+            },
+            GpuStmt::Let {
+                name: "dist",
+                mutable: false,
+                explicit_ty: None,
+                init: GpuExpr::MathCall {
+                    receiver: Box::new(GpuExpr::Var("v1")),
+                    intrinsic: GpuMathIntrinsic::Distance,
+                    args: vec![GpuExpr::Var("v2")],
+                },
+            },
+            GpuStmt::Assign {
+                op: GpuAssignOp::AddAssign,
+                target: GpuLValue::Field {
+                    base: Box::new(GpuLValue::Var("pos")),
+                    field: "x",
+                },
+                value: GpuExpr::Binary {
+                    op: GpuBinaryOp::Add,
+                    lhs: Box::new(GpuExpr::Var("d")),
+                    rhs: Box::new(GpuExpr::Binary {
+                        op: GpuBinaryOp::Add,
+                        lhs: Box::new(GpuExpr::Var("len")),
+                        rhs: Box::new(GpuExpr::Var("dist")),
+                    }),
+                },
+            },
+            GpuStmt::Assign {
+                op: GpuAssignOp::AddAssign,
+                target: GpuLValue::Field {
+                    base: Box::new(GpuLValue::Var("pos")),
+                    field: "y",
+                },
+                value: GpuExpr::Index {
+                    base: Box::new(GpuExpr::Var("norm")),
+                    index: Box::new(GpuExpr::Lit(GpuLit::UntypedInt(1))),
+                },
+            },
+        ],
+    };
+
+    let comp = GpuComponentSchema {
+        param_name: "pos",
+        struct_name: <SimPosition as GpuShaderStruct>::STRUCT_NAME,
+        fields: <SimPosition as GpuShaderStruct>::FIELDS,
+        mutable: true,
+    };
+    let binding = GpuKernelBindingSpec {
+        param_name: "pos",
+        struct_name: <SimPosition as GpuShaderStruct>::STRUCT_NAME,
+        type_id: crate::ComponentTypeId::of::<SimPosition>(),
+        elem_size: std::mem::size_of::<SimPosition>(),
+        mutable: true,
+    };
+
+    let (msl, wgsl) = crate::storage::gpu::ir::compile_kernel_ir_sources(
+        "test_vector_ir_pipeline",
+        &[comp],
+        &[<SimPosition as GpuShaderStruct>::msl_struct_definition()],
+        &[<SimPosition as GpuShaderStruct>::wgsl_struct_definition()],
+        &[binding],
+        &block,
+    );
+
+    // 验证 WGSL 源码结构与向量运算
+    assert!(wgsl.contains("vec3<f32>(1.0, 2.0, 3.0)"));
+    assert!(wgsl.contains("dot(v1, v2)"));
+    assert!(wgsl.contains("length(v_mul)"));
+    assert!(wgsl.contains("normalize(v1)"));
+    assert!(wgsl.contains("distance(v1, v2)"));
+
+    // 验证 MSL 源码结构与向量运算
+    assert!(msl.contains("float3(1.0, 2.0, 3.0)"));
+    assert!(msl.contains("dot(v1, v2)"));
+    assert!(msl.contains("length(v_mul)"));
+    assert!(msl.contains("normalize(v1)"));
+    assert!(msl.contains("distance(v1, v2)"));
+
+    unsafe fn cpu_dummy(_: &[*mut u8], _: usize, _: &crate::storage::gpu::GpuDispatchUniforms) {}
+
+    let desc = unsafe {
+        GpuKernelDescriptor::new(
+            "test_vector_ir_pipeline",
+            vec![binding],
+            msl,
+            wgsl,
+            cpu_dummy,
+        )
+    };
+
+    let compiled = compile_and_validate_pipeline(&desc)
+        .expect("Generated vector IR WGSL must pass Naga validation");
+    assert!(compiled.shader_validated);
+    assert!(compiled.naga_translated_msl.contains("kernel void"));
+}
+
+#[test]
+fn m11_redundant_writeback_elimination() {
+    let desc_particle = update_vec_particle_m11.descriptor();
+    let msl_part = desc_particle.msl_source();
+    let wgsl_part = desc_particle.wgsl_source();
+
+    // 1. mass 是只读引用 (&SimMass)，确保 writeback 被完全消除
+    assert!(
+        !msl_part.contains("sumeru_buf_mass[gid] = mass;"),
+        "Redundant writeback for read-only `mass` must be eliminated from MSL: {msl_part}"
+    );
+    assert!(
+        !wgsl_part.contains("sumeru_buf_mass[gid] = mass;"),
+        "Redundant writeback for read-only `mass` must be eliminated from WGSL: {wgsl_part}"
+    );
+
+    // 2. mass 声明必须使用只读限定符
+    assert!(
+        msl_part.contains("const device SimMass* sumeru_buf_mass [[buffer(1)]]"),
+        "MSL buffer for read-only `mass` must be `const device`: {msl_part}"
+    );
+    assert!(
+        wgsl_part.contains("var<storage, read> sumeru_buf_mass"),
+        "WGSL buffer for read-only `mass` must be `var<storage, read>`: {wgsl_part}"
+    );
+
+    // 3. p 是可写参数且在函数体内被写入，必须保留 writeback
+    assert!(
+        msl_part.contains("sumeru_buf_p[gid] = p;"),
+        "Writeback for mutable `p` must be preserved in MSL: {msl_part}"
+    );
+    assert!(
+        wgsl_part.contains("sumeru_buf_p[gid] = p;"),
+        "Writeback for mutable `p` must be preserved in WGSL: {wgsl_part}"
+    );
+
+    // 4. 针对声明为 `&mut` 但函数体内从未写入的参数，验证写入消除与只读限定符优化
+    let desc_inspector = read_only_inspector_kernel.descriptor();
+    let msl_insp = desc_inspector.msl_source();
+    let wgsl_insp = desc_inspector.wgsl_source();
+
+    assert!(
+        !msl_insp.contains("sumeru_buf_p[gid] = p;"),
+        "Unwritten `&mut p` must have its writeback eliminated in MSL: {msl_insp}"
+    );
+    assert!(
+        !wgsl_insp.contains("sumeru_buf_p[gid] = p;"),
+        "Unwritten `&mut p` must have its writeback eliminated in WGSL: {wgsl_insp}"
+    );
+    assert!(
+        msl_insp.contains("const device SimPosition* sumeru_buf_p [[buffer(0)]]"),
+        "Unwritten `&mut p` must be qualified as `const device` in MSL: {msl_insp}"
+    );
+    assert!(
+        wgsl_insp.contains("var<storage, read> sumeru_buf_p"),
+        "Unwritten `&mut p` must be qualified as `var<storage, read>` in WGSL: {wgsl_insp}"
+    );
+
+    // 5. 编译并通过 Naga 验证（严格校验只读管线资源绑定）
+    let compiled_part = compile_and_validate_pipeline(desc_particle)
+        .expect("Kernel with read-only elimination must pass Naga validation");
+    assert!(compiled_part.shader_validated);
+
+    let compiled_insp = compile_and_validate_pipeline(desc_inspector)
+        .expect("Inspector kernel with unwritten &mut elimination must pass Naga validation");
+    assert!(compiled_insp.shader_validated);
+}
+
+#[test]
+fn m11_three_tier_vector_math_traversal() {
+    let mut store_seq = Store::new().with_layout_optimization(LayoutOptimization::PageAlignedGpu);
+    for i in 0..128u128 {
+        let e = EntityId::from_u128(i + 1);
+        store_seq
+            .insert((
+                e,
+                (
+                    SimVecParticle {
+                        pos: [i as f32, (i * 2) as f32, 0.0],
+                        vel: [3.0, 4.0, 0.0],
+                        speed: 0.0,
+                    },
+                    SimMass { inv_mass: 0.5 },
+                ),
+            ))
+            .unwrap();
+    }
+    let mut store_par = store_seq.clone();
+    let mut store_gpu = store_seq.clone();
+
+    // 验证 CPU 向量工具函数与 Trait 一致性
+    let v2 = vec2(3.0, 4.0);
+    assert_eq!(length(v2), 5.0);
+    assert_eq!(dot(v2, vec2(1.0, 0.0)), 3.0);
+    assert_eq!(distance(v2, vec2(0.0, 0.0)), 5.0);
+    let n2 = normalize(v2);
+    assert!((n2[0] - 0.6).abs() < 1e-5);
+    assert!((n2[1] - 0.8).abs() < 1e-5);
+
+    let v4 = vec4(1.0, 2.0, 3.0, 4.0);
+    assert_eq!(dot(v4, v4), 30.0);
+
+    // Tier 1: CPU Sequential
+    store_seq
+        .query_mut::<(&mut SimVecParticle, &SimMass)>()
+        .unwrap()
+        .run(update_vec_particle_m11);
+
+    // Tier 2: CPU Rayon Morsel Parallel
+    store_par
+        .query_mut::<(&mut SimVecParticle, &SimMass)>()
+        .unwrap()
+        .par_run(update_vec_particle_m11);
+
+    // Tier 3: GPU (CPU fallback or hardware Metal)
+    let mut engine = MetalComputeEngine::new();
+    store_gpu
+        .query_mut::<(&mut SimVecParticle, &SimMass)>()
+        .unwrap()
+        .gpu()
+        .for_each_on(&mut engine, update_vec_particle_m11)
+        .unwrap();
+
+    // 验证三层遍历结果 100% 严格一致
+    for i in 0..128u128 {
+        let e = EntityId::from_u128(i + 1);
+        let p_seq = *store_seq.get::<SimVecParticle>(e).unwrap();
+        let p_par = *store_par.get::<SimVecParticle>(e).unwrap();
+        let p_gpu = *store_gpu.get::<SimVecParticle>(e).unwrap();
+
+        assert!((p_seq.pos[0] - p_par.pos[0]).abs() < 1e-4, "Seq vs Par pos.x mismatch at {i}");
+        assert!((p_seq.pos[1] - p_par.pos[1]).abs() < 1e-4, "Seq vs Par pos.y mismatch at {i}");
+        assert!((p_seq.pos[2] - p_par.pos[2]).abs() < 1e-4, "Seq vs Par pos.z mismatch at {i}");
+        assert!((p_seq.speed - p_par.speed).abs() < 1e-4, "Seq vs Par speed mismatch at {i}");
+
+        assert!((p_seq.pos[0] - p_gpu.pos[0]).abs() < 1e-4, "Seq vs GPU pos.x mismatch at {i}");
+        assert!((p_seq.pos[1] - p_gpu.pos[1]).abs() < 1e-4, "Seq vs GPU pos.y mismatch at {i}");
+        assert!((p_seq.pos[2] - p_gpu.pos[2]).abs() < 1e-4, "Seq vs GPU pos.z mismatch at {i}");
+        assert!((p_seq.speed - p_gpu.speed).abs() < 1e-4, "Seq vs GPU speed mismatch at {i}");
+    }
+}
+
+// ============================================================================
+// M12: 面向算子直调与元组管线的对称计算模型 (`#[kernel]`, `Vec2/3/4`, `queries_mut`, `ComputeTask`)
+// ============================================================================
+
+#[crate::kernel]
+pub struct ErgoPosition {
+    pub coords: crate::Vec3,
+    pub uv: crate::Vec2,
+}
+
+#[crate::kernel]
+pub struct ErgoVelocity {
+    pub velocity: crate::Vec3,
+}
+
+#[crate::kernel]
+pub struct ErgoDynamics {
+    pub force: crate::Vec3,
+    pub tint: crate::Vec4,
+    pub drag: f32,
+}
+
+#[crate::kernel]
+pub struct ErgoActiveTag {
+    pub active: u32,
+}
+
+#[crate::kernel]
+pub struct ErgoFrozenTag {
+    pub frozen: u32,
+}
+
+#[crate::kernel]
+pub fn ergo_integrate(pos: &mut ErgoPosition, vel: &ErgoVelocity, dt: f32) {
+    pos.coords += vel.velocity * dt;
+    pos.uv.x += dt;
+    pos.uv.y = pos.coords.x * 0.5;
+}
+
+#[crate::kernel]
+pub fn ergo_damp_dynamics(vel: &mut ErgoVelocity, dyns: &mut ErgoDynamics, dt: f32) {
+    let v_acc = vel.velocity + dyns.force * dt;
+    let damp_factor = (1.0 - dyns.drag * dt).max(0.0);
+    let len_sq = v_acc.length_squared();
+    vel.velocity = v_acc * damp_factor + crate::Vec3::splat(len_sq * 0.0);
+    dyns.force *= 0.5;
+    dyns.tint.w = v_acc.dot(dyns.force);
+}
+
+#[crate::kernel]
+pub fn ergo_step_fused(
+    pos: &mut ErgoPosition,
+    vel: &mut ErgoVelocity,
+    dyns: &mut ErgoDynamics,
+    dt: f32,
+) {
+    ergo_integrate(pos, vel, dt);
+    ergo_damp_dynamics(vel, dyns, dt);
+    ergo_integrate(pos, vel, dt);
+}
+
+#[crate::kernel]
+pub fn ergo_touch_pos_only(pos: &mut ErgoPosition, offset: f32) {
+    pos.coords.z += offset;
+}
+
+#[crate::kernel]
+pub fn ergo_touch_dyns_only(dyns: &mut ErgoDynamics, scale: f32) {
+    dyns.drag *= scale;
+}
+
+#[test]
+fn m12_vec2_vec3_vec4_operator_overloading_and_kernel_parity() {
+    use crate::{Vec2, Vec3, Vec4};
+
+    let a = Vec3::new(1.0, 2.0, 3.0);
+    let b = Vec3::new(4.0, 5.0, 6.0);
+    assert_eq!(a + b, Vec3::new(5.0, 7.0, 9.0));
+    assert_eq!(b - a, Vec3::new(3.0, 3.0, 3.0));
+    assert_eq!(a * 2.0, Vec3::new(2.0, 4.0, 6.0));
+    assert_eq!(2.0 * a, Vec3::new(2.0, 4.0, 6.0));
+    assert_eq!(b / 2.0, Vec3::new(2.0, 2.5, 3.0));
+    assert_eq!(-a, Vec3::new(-1.0, -2.0, -3.0));
+    assert_eq!(a.dot(b), 32.0);
+    assert_eq!(Vec2::new(3.0, 4.0).length(), 5.0);
+    assert_eq!(Vec2::new(3.0, 4.0).length_squared(), 25.0);
+    assert!((Vec4::splat(2.0).normalize().length() - 1.0).abs() < 1e-5);
+
+    let mut store_par =
+        Store::new().with_layout_optimization(crate::LayoutOptimization::PageAlignedGpu);
+    for i in 0..1500usize {
+        store_par
+            .insert((
+                EntityId::from_u128(i as u128 + 1),
+                (
+                    ErgoPosition {
+                        coords: Vec3::new(1.0, 2.0, 3.0),
+                        uv: Vec2::new(0.0, 0.0),
+                    },
+                    ErgoVelocity {
+                        velocity: Vec3::new(10.0, 20.0, 30.0),
+                    },
+                    ErgoDynamics {
+                        force: Vec3::new(2.0, 4.0, 6.0),
+                        tint: Vec4::new(1.0, 1.0, 1.0, 0.0),
+                        drag: 0.5,
+                    },
+                    ErgoActiveTag { active: 1 },
+                ),
+            ))
+            .unwrap();
+    }
+    // 插入冻结实体（验证 `.without::<ErgoFrozenTag>()` 过滤隔离）
+    let frozen_id = EntityId::from_u128(999_999);
+    store_par
+        .insert((
+            frozen_id,
+            (
+                ErgoPosition {
+                    coords: Vec3::splat(50.0),
+                    uv: Vec2::ZERO,
+                },
+                ErgoVelocity {
+                    velocity: Vec3::splat(10.0),
+                },
+                ErgoDynamics {
+                    force: Vec3::splat(1.0),
+                    tint: Vec4::ZERO,
+                    drag: 0.1,
+                },
+                ErgoActiveTag { active: 1 },
+                ErgoFrozenTag { frozen: 1 },
+            ),
+        ))
+        .unwrap();
+
+    let mut store_gpu = store_par.clone();
+    let mut store_fused = store_par.clone();
+    let mut store_rayon = store_par.clone();
+
+    // 1. `.par()` 多算子元组管线（>= 1024 行自动走 Rayon 1024-row Morsel 多核并行）
+    {
+        use crate::{ComputeTask, QueryTupleFilterExt};
+        let (mut pos, mut vel, mut dyns) = store_par
+            .queries_mut::<(&mut ErgoPosition, &mut ErgoVelocity, &mut ErgoDynamics)>()
+            .unwrap()
+            .with::<ErgoActiveTag>()
+            .without::<ErgoFrozenTag>();
+
+        let par_stats = (
+            ergo_integrate.bind(&mut pos, &vel, 0.1),
+            ergo_damp_dynamics.bind(&mut vel, &mut dyns, 0.1),
+            ergo_integrate.bind(&mut pos, &vel, 0.1),
+        )
+            .par()
+            .unwrap();
+        assert_eq!(par_stats.total_rows, 1500 * 3);
+        assert_eq!(pos.cache_misses(), 1);
+        assert!(pos.cache_hits() >= 2);
+    }
+
+    // 2. `.gpu()` 多算子元组管线（自动检测 RAW/WAW/WAR 依赖插入 2 道显存屏障，单次 CommandBuffer 提交）
+    {
+        use crate::{ComputeTask, QueryTupleFilterExt};
+        let (mut pos, mut vel, mut dyns) = store_gpu
+            .queries_mut::<(&mut ErgoPosition, &mut ErgoVelocity, &mut ErgoDynamics)>()
+            .unwrap()
+            .with::<ErgoActiveTag>()
+            .without::<ErgoFrozenTag>();
+
+        let gpu_stats = (
+            ergo_integrate.bind(&mut pos, &vel, 0.1),
+            ergo_damp_dynamics.bind(&mut vel, &mut dyns, 0.1),
+            ergo_integrate.bind(&mut pos, &vel, 0.1),
+        )
+            .gpu()
+            .unwrap();
+        assert_eq!(gpu_stats.total_rows, 1500 * 3);
+        assert_eq!(gpu_stats.barriers_inserted, 2);
+
+        // 验证无读写交集的两阶段管线自动 0 屏障插入
+        let disjoint_stats = (
+            ergo_touch_pos_only.bind(&mut pos, 0.0),
+            ergo_touch_dyns_only.bind(&mut dyns, 1.0),
+        )
+            .gpu()
+            .unwrap();
+        assert_eq!(disjoint_stats.barriers_inserted, 0);
+    }
+
+    // 3. 单 Kernel 融合算子 `ergo_step_fused.run(...)`
+    {
+        use crate::QueryTupleFilterExt;
+        let (mut pos, mut vel, mut dyns) = store_fused
+            .queries_mut::<(&mut ErgoPosition, &mut ErgoVelocity, &mut ErgoDynamics)>()
+            .unwrap()
+            .with::<ErgoActiveTag>()
+            .without::<ErgoFrozenTag>();
+        let fused_stats = ergo_step_fused
+            .run(&mut pos, &mut vel, &mut dyns, 0.1)
+            .unwrap();
+        assert_eq!(fused_stats.total_rows, 1500);
+        assert_eq!(fused_stats.barriers_inserted, 0);
+    }
+
+    // 4. 用户手写 Rayon `.into_par_iter()` 循环直接调用同一 `#[kernel]` 函数
+    {
+        use crate::QueryTupleFilterExt;
+        use rayon::prelude::*;
+        let (mut pos, mut vel, mut dyns) = store_rayon
+            .queries_mut::<(&mut ErgoPosition, &mut ErgoVelocity, &mut ErgoDynamics)>()
+            .unwrap()
+            .with::<ErgoActiveTag>()
+            .without::<ErgoFrozenTag>();
+
+        (&mut pos, &mut vel, &mut dyns)
+            .into_par_iter()
+            .for_each(|(p, v, d)| ergo_step_fused(p, v, d, 0.1));
+        assert_eq!(pos.cache_misses(), 1);
+        assert!(pos.cache_hits() >= 2);
+    }
+
+    // 验证四种执行形态结果 100% 严格一致，且 Frozen 实体未被修改
+    for i in [1u128, 512, 1024, 1500] {
+        let e = EntityId::from_u128(i);
+        let p_par = *store_par.get::<ErgoPosition>(e).unwrap();
+        let p_gpu = *store_gpu.get::<ErgoPosition>(e).unwrap();
+        let p_fused = *store_fused.get::<ErgoPosition>(e).unwrap();
+        let p_rayon = *store_rayon.get::<ErgoPosition>(e).unwrap();
+
+        assert!((p_par.coords - p_gpu.coords).length() < 1e-4);
+        assert!((p_par.coords - p_fused.coords).length() < 1e-4);
+        assert!((p_par.coords - p_rayon.coords).length() < 1e-4);
+        assert!((p_par.uv - p_gpu.uv).length() < 1e-4);
+    }
+    assert_eq!(
+        store_gpu.get::<ErgoPosition>(frozen_id).unwrap().coords,
+        Vec3::splat(50.0)
+    );
+}
+
+#[test]
+fn m12_shared_col_cache_zero_recompute_and_incremental_cr_refresh() {
+    use crate::{QueryTupleFilterExt, Vec2, Vec3};
+
+    let mut store =
+        Store::new().with_layout_optimization(crate::LayoutOptimization::PageAlignedGpu);
+    for i in 0..64usize {
+        store
+            .insert((
+                EntityId::from_u128(i as u128 + 1),
+                (
+                    ErgoPosition {
+                        coords: Vec3::new(0.0, 0.0, 0.0),
+                        uv: Vec2::ZERO,
+                    },
+                    ErgoVelocity {
+                        velocity: Vec3::new(1.0, 2.0, 3.0),
+                    },
+                    ErgoActiveTag { active: 1 },
+                ),
+            ))
+            .unwrap();
+    }
+
+    let shared_cache_clone = {
+        let (mut pos, vel) = store
+            .queries_mut::<(&mut ErgoPosition, &ErgoVelocity)>()
+            .unwrap()
+            .with::<ErgoActiveTag>();
+
+        // 首次执行（< 1024 行自适应走当前线程顺序执行）：冷启动扫描 1 次
+        ergo_integrate.par(&mut pos, &vel, 1.0).unwrap();
+        assert_eq!(pos.cache_misses(), 1);
+        assert_eq!(pos.cache_hits(), 0);
+
+        // 无 CR 变更连续执行 3 次：必须 100% 命中缓存，misses 保持为 1
+        ergo_integrate.par(&mut pos, &vel, 1.0).unwrap();
+        ergo_integrate.gpu(&mut pos, &vel, 1.0).unwrap();
+        ergo_integrate.run(&mut pos, &vel, 1.0).unwrap();
+        assert_eq!(pos.cache_misses(), 1);
+        assert_eq!(pos.cache_hits(), 3);
+
+        std::sync::Arc::clone(&pos.shared_cache)
+    };
+
+    // 触发 CR 结构变更：新增含额外组件 `ErgoDynamics` 的新 Archetype
+    let new_e = EntityId::from_u128(10_000);
+    store
+        .insert((
+            new_e,
+            (
+                ErgoPosition {
+                    coords: Vec3::ZERO,
+                    uv: Vec2::ZERO,
+                },
+                ErgoVelocity {
+                    velocity: Vec3::new(5.0, 5.0, 5.0),
+                },
+                ErgoDynamics {
+                    force: Vec3::ZERO,
+                    tint: crate::Vec4::ZERO,
+                    drag: 0.0,
+                },
+                ErgoActiveTag { active: 1 },
+            ),
+        ))
+        .unwrap();
+
+    // 验证 SharedColCache::resolve 执行 O(\Delta A) 增量刷新并纳入新 Archetype
+    let filter = crate::storage::query::With::<ErgoActiveTag, crate::storage::query::All> {
+        previous: crate::storage::query::All,
+        type_id: crate::ComponentTypeId::of::<ErgoActiveTag>(),
+        marker: std::marker::PhantomData,
+    };
+    let refreshed = crate::SharedColCache::resolve(&shared_cache_clone, &store, &filter);
+    assert_eq!(refreshed.len(), 2);
+}
+
+
+
+
 
 
 

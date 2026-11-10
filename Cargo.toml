@@ -45,3 +45,8 @@ path = "examples/flecs/main.rs"
 name = "gpu"
 path = "examples/gpu/main.rs"
 required-features = ["gpu"]
+
+[[example]]
+name = "gpu_multi_kernel_pass"
+path = "examples/gpu_multi_kernel_pass.rs"
+required-features = ["gpu"]

@@ -1,11 +1,11 @@
 //! Procedural macros for Sumeru 16KB page-aligned GPU compute (`#[gpu]`, `#[gpu_component]`, `#[gpu_kernel]`).
 //!
 //! Lowers Rust `syn` AST into Sumeru's target-independent Typed Shader IR (`GpuBlock` / `GpuStmt` / `GpuExpr`)
-//! with lexical scope tracking, compile-time `const` evaluation (`GpuConstValue`), and composable `#[gpu]`
-//! pure helper functions (`GpuHelperFnDescriptor`).
+//! with lexical scope tracking, compile-time `const` evaluation (`GpuConstValue`), runtime dynamic scalar
+//! uniforms (`GpuScalarUniformSpec`), and composable `#[gpu]` helper functions (`GpuHelperFnDescriptor`).
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Literal, TokenStream as TokenStream2};
 use quote::{quote, ToTokens};
 use syn::{
     BinOp, Block, Data, DeriveInput, Error, Expr, Fields, FnArg, GenericParam, Ident, Item,
@@ -16,12 +16,25 @@ use syn::{
 ///
 /// - When placed on a `struct`, expands to a `#[repr(C)]` Pod/Zeroable GPU component with
 ///   automatic `GpuComponent` and `GpuShaderStruct` (MSL + WGSL) implementations.
-/// - When placed on a `fn` with `&T` / `&mut T` component parameters, lowers the Rust AST into
-///   a Typed Shader IR (`GpuBlock`) and expands to a three-tier operator (`run`, `par_run`, `gpu().for_each`).
-/// - When placed on a pure scalar `fn(f32, ...) -> f32`, expands to a composable `#[gpu]` device helper
-///   function that can be called both on CPU and from inside other `#[gpu]` kernels/helpers.
+/// - When placed on a `fn` with `1..=8` `&T` / `&mut T` component parameters (and optional trailing
+///   runtime scalar uniform parameters), lowers the Rust AST into a Typed Shader IR (`GpuBlock`)
+///   and expands to a three-tier operator (`run`, `par_run`, `gpu().for_each`).
+/// - When placed on a helper `fn` (returning a scalar or taking array/scalar references), expands to
+///   a composable `#[gpu]` device helper function callable on both CPU and GPU.
 #[proc_macro_attribute]
 pub fn gpu(attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_gpu_item(attr.into(), item.into()).into()
+}
+
+/// Unified heterogeneous compute & component attribute macro for Sumeru ECS (`#[kernel]`).
+///
+/// - On a `struct`: defines a 16KB page-aligned `#[repr(C)]` POD component with automatic
+///   `GpuComponent` and `GpuShaderStruct` (MSL + WGSL) implementations.
+/// - On a `fn`: defines a unified operator supporting row-level calls (`integrate(p, v, dt)`
+///   inside Rayon loops or composable `#[kernel]` functions) and whole-column execution
+///   (`integrate.run(...)`, `integrate.par(...)`, `integrate.gpu(...)`, `integrate.bind(...)`).
+#[proc_macro_attribute]
+pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_gpu_item(attr.into(), item.into()).into()
 }
 
@@ -207,11 +220,69 @@ struct ParsedKernelParam {
     elem_ty: Type,
 }
 
-struct ParsedHelperParam {
+struct ParsedUniformParam {
     ident: Ident,
     is_mut: bool,
     ty: Type,
     kind_tokens: TokenStream2,
+}
+
+struct ParsedHelperParam {
+    ident: Ident,
+    is_mut_binding: bool,
+    ty: Type,
+    spec_tokens: TokenStream2,
+}
+
+fn is_unit_type(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(t) if t.elems.is_empty())
+}
+
+fn is_scalar_type_name(s: &str) -> bool {
+    matches!(s.trim(), "f32" | "i32" | "u32" | "usize" | "bool")
+}
+
+fn parse_array_type_info(ty: &Type) -> Option<(TokenStream2, usize)> {
+    match ty {
+        Type::Array(arr) => {
+            let elem_kind = parse_scalar_kind_tokens(&arr.elem).ok()?;
+            let Expr::Lit(expr_lit) = &arr.len else {
+                return None;
+            };
+            let Lit::Int(il) = &expr_lit.lit else {
+                return None;
+            };
+            let len: usize = il.base10_parse().ok()?;
+            if (2..=4).contains(&len) {
+                Some((elem_kind, len))
+            } else {
+                None
+            }
+        }
+        Type::Path(tp) if tp.qself.is_none() => {
+            let last = tp.path.segments.last()?.ident.to_string();
+            match last.as_str() {
+                "Vec2" => Some((quote! { ::sumeru::GpuScalarKind::F32 }, 2)),
+                "Vec3" => Some((quote! { ::sumeru::GpuScalarKind::F32 }, 3)),
+                "Vec4" => Some((quote! { ::sumeru::GpuScalarKind::F32 }, 4)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_component_struct_ref(ty: &Type) -> bool {
+    let Type::Reference(ty_ref) = ty else {
+        return false;
+    };
+    match &*ty_ref.elem {
+        Type::Reference(_) | Type::Array(_) | Type::Slice(_) | Type::Tuple(_) => false,
+        other => {
+            !is_scalar_type_name(&other.to_token_stream().to_string())
+                && parse_array_type_info(other).is_none()
+        }
+    }
 }
 
 fn validate_fn_common_signature(sig: &syn::Signature) -> syn::Result<()> {
@@ -280,19 +351,45 @@ fn expand_gpu_fn_impl(
     let sig = &item_fn.sig;
     validate_fn_common_signature(sig)?;
 
-    // Determine whether this is a pure scalar helper function (`fn(f32, ...) -> f32`)
-    // or a component kernel function (`fn(&mut CompA, &CompB)`).
+    // 1. Non-unit return type -> always a composable helper function
     if let ReturnType::Type(_, ret_ty) = &sig.output {
-        if !same_name_callable || !attr.is_empty() {
-            return Err(Error::new_spanned(
-                ret_ty,
-                "`#[gpu_kernel]` entry points must not have a return type; use `#[gpu]` for composable scalar helper functions",
-            ));
+        if !is_unit_type(ret_ty) {
+            if !same_name_callable || !attr.is_empty() {
+                return Err(Error::new_spanned(
+                    ret_ty,
+                    "`#[gpu_kernel]` entry points must not have a return type; use `#[gpu]` for composable helper functions",
+                ));
+            }
+            return expand_gpu_helper_fn_impl(&item_fn, Some(ret_ty));
         }
-        return expand_gpu_helper_fn_impl(&item_fn, ret_ty);
     }
 
-    let mut params = Vec::new();
+    // 2. Unit return type, but first parameter is not a component struct reference (e.g. `&mut [f32; 3]` or `&mut f32`)
+    if same_name_callable && attr.is_empty() && !sig.inputs.is_empty() {
+        let first_is_comp_ref = match sig.inputs.first().unwrap() {
+            FnArg::Typed(pt) => is_component_struct_ref(&pt.ty),
+            FnArg::Receiver(_) => false,
+        };
+        let has_array_or_scalar_ref = sig.inputs.iter().any(|arg| match arg {
+            FnArg::Typed(pt) => match &*pt.ty {
+                Type::Reference(tr) => {
+                    parse_array_type_info(&tr.elem).is_some()
+                        || is_scalar_type_name(&tr.elem.to_token_stream().to_string())
+                }
+                Type::Array(_) => true,
+                _ => false,
+            },
+            FnArg::Receiver(_) => false,
+        });
+        if !first_is_comp_ref || has_array_or_scalar_ref {
+            return expand_gpu_helper_fn_impl(&item_fn, None);
+        }
+    }
+
+    let mut comp_params = Vec::new();
+    let mut uniform_params = Vec::new();
+    let mut seen_scalar_uniform = false;
+
     for arg in &sig.inputs {
         let FnArg::Typed(pat_type) = arg else {
             return Err(Error::new_spanned(
@@ -313,33 +410,58 @@ fn expand_gpu_fn_impl(
                 "`#[gpu]` parameter name cannot start with reserved prefix `__` or `sumeru_`",
             ));
         }
-        let Type::Reference(ty_ref) = &*pat_type.ty else {
-            return Err(Error::new_spanned(
-                &pat_type.ty,
-                format!("parameter `{pname}` in `#[gpu]` kernel must be `&T` or `&mut T`"),
-            ));
-        };
-        if matches!(&*ty_ref.elem, Type::Reference(_)) {
-            return Err(Error::new_spanned(
-                &ty_ref.elem,
-                format!("parameter `{pname}` cannot be a nested reference"),
-            ));
+        match &*pat_type.ty {
+            Type::Reference(ty_ref) => {
+                if seen_scalar_uniform {
+                    return Err(Error::new_spanned(
+                        &pat_type.ty,
+                        format!(
+                            "component reference parameter `{pname}` must appear before trailing scalar uniform parameters in `#[gpu]` kernel"
+                        ),
+                    ));
+                }
+                if matches!(&*ty_ref.elem, Type::Reference(_)) {
+                    return Err(Error::new_spanned(
+                        &ty_ref.elem,
+                        format!("parameter `{pname}` cannot be a nested reference"),
+                    ));
+                }
+                comp_params.push(ParsedKernelParam {
+                    ident: pat_ident.ident.clone(),
+                    is_mut: ty_ref.mutability.is_some(),
+                    elem_ty: (*ty_ref.elem).clone(),
+                });
+            }
+            other_ty => {
+                seen_scalar_uniform = true;
+                let kind_tokens = parse_scalar_kind_tokens(other_ty)?;
+                uniform_params.push(ParsedUniformParam {
+                    ident: pat_ident.ident.clone(),
+                    is_mut: pat_ident.mutability.is_some(),
+                    ty: other_ty.clone(),
+                    kind_tokens,
+                });
+            }
         }
-        params.push(ParsedKernelParam {
-            ident: pat_ident.ident.clone(),
-            is_mut: ty_ref.mutability.is_some(),
-            elem_ty: (*ty_ref.elem).clone(),
-        });
     }
 
-    if params.is_empty() || params.len() > 4 {
+    if comp_params.is_empty() || comp_params.len() > 8 {
         return Err(Error::new_spanned(
             &sig.inputs,
-            "`#[gpu]` kernel functions must have between 1 and 4 component reference parameters",
+            "`#[gpu]` kernel functions must have between 1 and 8 component reference parameters (`&T` or `&mut T`)",
+        ));
+    }
+    if uniform_params.len() > 4 {
+        return Err(Error::new_spanned(
+            &sig.inputs,
+            "`#[gpu]` kernel functions support at most 4 trailing runtime scalar uniform parameters",
         ));
     }
 
-    let root_names: Vec<String> = params.iter().map(|p| p.ident.to_string()).collect();
+    let mut root_names: Vec<String> = comp_params.iter().map(|p| p.ident.to_string()).collect();
+    for u in &uniform_params {
+        root_names.push(u.ident.to_string());
+    }
     let mut ir_builder = IrAstBuilder::new(root_names, false);
     let ir_block = ir_builder.lower_block(&item_fn.block)?;
 
@@ -348,50 +470,122 @@ fn expand_gpu_fn_impl(
     let fn_name = &sig.ident;
     let stmts = &item_fn.block.stmts;
 
-    let param_tokens = params.iter().map(|p| {
-        let ident = &p.ident;
-        let mode = if p.is_mut {
-            Ident::new("mut", ident.span())
-        } else {
-            Ident::new("ref", ident.span())
-        };
-        let ty = &p.elem_ty;
-        quote! { #ident : [#mode] #ty }
-    });
+    let comp_tokens: Vec<TokenStream2> = comp_params
+        .iter()
+        .map(|p| {
+            let ident = &p.ident;
+            let mode = if p.is_mut {
+                Ident::new("mut", ident.span())
+            } else {
+                Ident::new("ref", ident.span())
+            };
+            let ty = &p.elem_ty;
+            quote! { #ident : [#mode] #ty }
+        })
+        .collect();
 
-    if same_name_callable {
-        if !attr.is_empty() {
-            return Err(Error::new_spanned(
-                attr,
-                "`#[gpu]` on a function does not accept attribute arguments; use `#[gpu_kernel(CustomName)]` if needed",
-            ));
+    if uniform_params.is_empty() {
+        if same_name_callable {
+            if !attr.is_empty() {
+                return Err(Error::new_spanned(
+                    attr,
+                    "`#[gpu]` on a function does not accept attribute arguments; use `#[gpu_kernel(CustomName)]` if needed",
+                ));
+            }
+            Ok(quote! {
+                ::sumeru::sumeru_gpu_fn! {
+                    @ir
+                    #(#attrs)*
+                    #vis fn #fn_name ( #(#comp_tokens),* )
+                    ir = #ir_block,
+                    body = { #(#stmts)* }
+                }
+            })
+        } else {
+            let custom_ident: Ident = syn::parse2(attr)?;
+            Ok(quote! {
+                ::sumeru::sumeru_gpu_kernel! {
+                    @ir
+                    #(#attrs)*
+                    #vis kernel #custom_ident fn #fn_name ( #(#comp_tokens),* )
+                    ir = #ir_block,
+                    body = { #(#stmts)* }
+                }
+            })
         }
-        Ok(quote! {
-            ::sumeru::sumeru_gpu_fn! {
-                @ir
-                #(#attrs)*
-                #vis fn #fn_name ( #(#param_tokens),* )
-                ir = #ir_block,
-                body = { #(#stmts)* }
-            }
-        })
     } else {
-        let custom_ident: Ident = syn::parse2(attr)?;
-        Ok(quote! {
-            ::sumeru::sumeru_gpu_kernel! {
-                @ir
-                #(#attrs)*
-                #vis kernel #custom_ident fn #fn_name ( #(#param_tokens),* )
-                ir = #ir_block,
-                body = { #(#stmts)* }
+        let num_uniforms_lit = Literal::usize_unsuffixed(uniform_params.len());
+        let uniform_tokens: Vec<TokenStream2> = uniform_params
+            .iter()
+            .enumerate()
+            .map(|(slot_idx, u)| {
+                let slot_lit = Literal::usize_unsuffixed(slot_idx);
+                let ident = &u.ident;
+                let mode = if u.is_mut {
+                    Ident::new("mut", ident.span())
+                } else {
+                    Ident::new("ref", ident.span())
+                };
+                let ty = &u.ty;
+                let kind = &u.kind_tokens;
+                quote! { (#slot_lit) #ident : [#mode] #ty => #kind }
+            })
+            .collect();
+
+        if same_name_callable {
+            if !attr.is_empty() {
+                return Err(Error::new_spanned(
+                    attr,
+                    "`#[gpu]` on a function does not accept attribute arguments; use `#[gpu_kernel(CustomName)]` if needed",
+                ));
             }
-        })
+            Ok(quote! {
+                ::sumeru::sumeru_gpu_fn! {
+                    @ir_with_uniforms (#num_uniforms_lit)
+                    #(#attrs)*
+                    #vis fn #fn_name (
+                        components = [ #(#comp_tokens),* ],
+                        uniforms = [ #(#uniform_tokens),* ]
+                    )
+                    ir = #ir_block,
+                    body = { #(#stmts)* }
+                }
+            })
+        } else {
+            let custom_ident: Ident = syn::parse2(attr)?;
+            Ok(quote! {
+                ::sumeru::sumeru_gpu_kernel! {
+                    @ir_with_uniforms (#num_uniforms_lit)
+                    #(#attrs)*
+                    #vis kernel #custom_ident fn #fn_name (
+                        components = [ #(#comp_tokens),* ],
+                        uniforms = [ #(#uniform_tokens),* ]
+                    )
+                    ir = #ir_block,
+                    body = { #(#stmts)* }
+                }
+            })
+        }
     }
 }
 
-fn expand_gpu_helper_fn_impl(item_fn: &ItemFn, ret_ty: &Type) -> syn::Result<TokenStream2> {
+fn expand_gpu_helper_fn_impl(item_fn: &ItemFn, ret_ty: Option<&Type>) -> syn::Result<TokenStream2> {
     let sig = &item_fn.sig;
-    let ret_kind = parse_scalar_kind_tokens(ret_ty)?;
+    let (ret_ty_tokens, ret_kind_opt_tokens, has_return_val) = match ret_ty {
+        Some(ty) => {
+            let k = parse_scalar_kind_tokens(ty)?;
+            (
+                quote! { #ty },
+                quote! { ::std::option::Option::Some(#k) },
+                true,
+            )
+        }
+        None => (
+            quote! { () },
+            quote! { ::std::option::Option::None },
+            false,
+        ),
+    };
 
     let mut params = Vec::new();
     for arg in &sig.inputs {
@@ -414,33 +608,100 @@ fn expand_gpu_helper_fn_impl(item_fn: &ItemFn, ret_ty: &Type) -> syn::Result<Tok
                 "`#[gpu]` parameter name cannot start with reserved prefix `__` or `sumeru_`",
             ));
         }
-        if matches!(&*pat_type.ty, Type::Reference(_)) {
-            return Err(Error::new_spanned(
-                &pat_type.ty,
-                format!(
-                    "`#[gpu]` function with return type cannot take component reference `{pname}`; component kernels must not return a value, and pure helper functions must take scalar values (`f32`, `i32`, `u32`, `usize`, `bool`)"
-                ),
-            ));
-        }
-        let kind_tokens = parse_scalar_kind_tokens(&pat_type.ty)?;
+
+        let is_mut_binding = pat_ident.mutability.is_some();
+        let (is_mut_in_shader, by_mut_ref, kind_tokens) = match &*pat_type.ty {
+            Type::Reference(ty_ref) => {
+                let ref_is_mut = ty_ref.mutability.is_some();
+                if let Some((elem_kind, len)) = parse_array_type_info(&ty_ref.elem) {
+                    (
+                        ref_is_mut,
+                        ref_is_mut,
+                        quote! {
+                            ::sumeru::GpuHelperParamKind::Array {
+                                elem: #elem_kind,
+                                len: #len,
+                            }
+                        },
+                    )
+                } else if is_scalar_type_name(&ty_ref.elem.to_token_stream().to_string()) {
+                    let sk = parse_scalar_kind_tokens(&ty_ref.elem)?;
+                    (
+                        ref_is_mut,
+                        ref_is_mut,
+                        quote! { ::sumeru::GpuHelperParamKind::Scalar(#sk) },
+                    )
+                } else {
+                    let comp_ty = &*ty_ref.elem;
+                    (
+                        ref_is_mut,
+                        ref_is_mut,
+                        quote! {
+                            ::sumeru::GpuHelperParamKind::Struct {
+                                struct_name: <#comp_ty as ::sumeru::GpuShaderStruct>::STRUCT_NAME,
+                                type_id: ::sumeru::ComponentTypeId::of::<#comp_ty>(),
+                                fields: <#comp_ty as ::sumeru::GpuShaderStruct>::FIELDS,
+                                msl_def: <#comp_ty as ::sumeru::GpuShaderStruct>::msl_struct_definition,
+                                wgsl_def: <#comp_ty as ::sumeru::GpuShaderStruct>::wgsl_struct_definition,
+                            }
+                        },
+                    )
+                }
+            }
+            other_ty => {
+                if let Some((elem_kind, len)) = parse_array_type_info(other_ty) {
+                    (
+                        is_mut_binding,
+                        false,
+                        quote! {
+                            ::sumeru::GpuHelperParamKind::Array {
+                                elem: #elem_kind,
+                                len: #len,
+                            }
+                        },
+                    )
+                } else {
+                    let sk = parse_scalar_kind_tokens(other_ty)?;
+                    (
+                        is_mut_binding,
+                        false,
+                        quote! { ::sumeru::GpuHelperParamKind::Scalar(#sk) },
+                    )
+                }
+            }
+        };
+
+        let spec_tokens = quote! {
+            ::sumeru::GpuHelperParamSpec {
+                name: #pname,
+                is_mut: #is_mut_in_shader,
+                by_mut_ref: #by_mut_ref,
+                kind: #kind_tokens,
+            }
+        };
+
         params.push(ParsedHelperParam {
             ident: pat_ident.ident.clone(),
-            is_mut: pat_ident.mutability.is_some(),
+            is_mut_binding,
             ty: (*pat_type.ty).clone(),
-            kind_tokens,
+            spec_tokens,
         });
     }
 
     if params.is_empty() || params.len() > 8 {
         return Err(Error::new_spanned(
             &sig.inputs,
-            "`#[gpu]` pure helper functions must have between 1 and 8 scalar parameters",
+            "`#[gpu]` helper functions must have between 1 and 8 parameters",
         ));
     }
 
     let root_names: Vec<String> = params.iter().map(|p| p.ident.to_string()).collect();
-    let mut ir_builder = IrAstBuilder::new(root_names, true);
-    let ir_block = ir_builder.lower_block_with_tail_return(&item_fn.block)?;
+    let mut ir_builder = IrAstBuilder::new(root_names, has_return_val);
+    let ir_block = if has_return_val {
+        ir_builder.lower_block_with_tail_return(&item_fn.block)?
+    } else {
+        ir_builder.lower_block(&item_fn.block)?
+    };
 
     let attrs = &item_fn.attrs;
     let vis = &item_fn.vis;
@@ -449,20 +710,20 @@ fn expand_gpu_helper_fn_impl(item_fn: &ItemFn, ret_ty: &Type) -> syn::Result<Tok
 
     let param_tokens = params.iter().map(|p| {
         let ident = &p.ident;
-        let mode = if p.is_mut {
+        let mode = if p.is_mut_binding {
             Ident::new("mut", ident.span())
         } else {
             Ident::new("ref", ident.span())
         };
         let ty = &p.ty;
-        let kind = &p.kind_tokens;
-        quote! { #ident : [#mode] #ty => #kind }
+        let spec = &p.spec_tokens;
+        quote! { #ident : [#mode] #ty => #spec }
     });
 
     Ok(quote! {
         ::sumeru::sumeru_gpu_helper_fn! {
             #(#attrs)*
-            #vis fn #fn_name ( #(#param_tokens),* ) -> #ret_ty => #ret_kind,
+            #vis fn #fn_name ( #(#param_tokens),* ) -> #ret_ty_tokens => #ret_kind_opt_tokens,
             ir = #ir_block,
             body = { #(#stmts)* }
         }
@@ -479,10 +740,18 @@ fn parse_scalar_kind_tokens(ty: &Type) -> syn::Result<TokenStream2> {
         _ => Err(Error::new_spanned(
             ty,
             format!(
-                "type `{s}` is not supported in `#[gpu]` scalar annotations/casts/helpers; use `f32`, `i32`, `u32`, `usize`, or `bool`"
+                "type `{s}` is not supported in `#[gpu]` scalar annotations/casts/uniforms; use `f32`, `i32`, `u32`, `usize`, or `bool`"
             ),
         )),
     }
+}
+
+fn parse_value_type_tokens(ty: &Type) -> syn::Result<TokenStream2> {
+    if let Some((elem_kind, len)) = parse_array_type_info(ty) {
+        return Ok(quote! { ::sumeru::GpuValueType::Array(#elem_kind, #len) });
+    }
+    let sk = parse_scalar_kind_tokens(ty)?;
+    Ok(quote! { ::sumeru::GpuValueType::Scalar(#sk) })
 }
 
 /// Lexical-scope-aware AST-to-Typed-Shader-IR builder.
@@ -628,8 +897,8 @@ impl IrAstBuilder {
                                 "unsupported pattern in `#[gpu]` local variable declaration",
                             ));
                         };
-                        let kind_tokens = parse_scalar_kind_tokens(&pt.ty)?;
-                        (&pi.ident, pi.mutability.is_some(), Some(kind_tokens))
+                        let vt_tokens = parse_value_type_tokens(&pt.ty)?;
+                        (&pi.ident, pi.mutability.is_some(), Some(vt_tokens))
                     }
                     other => {
                         return Err(Error::new_spanned(
@@ -668,21 +937,21 @@ impl IrAstBuilder {
                         "const name in `#[gpu]` kernel cannot start with `__` or `sumeru_`",
                     ));
                 }
-                let kind_tokens = parse_scalar_kind_tokens(&item_const.ty)?;
+                let vt_tokens = parse_value_type_tokens(&item_const.ty)?;
                 let rhs = self.lower_expr(&item_const.expr)?;
                 self.declare_local(vname.clone());
                 Ok(quote! {
                     ::sumeru::GpuStmt::Let {
                         name: #vname,
                         mutable: false,
-                        explicit_ty: ::std::option::Option::Some(#kind_tokens),
+                        explicit_ty: ::std::option::Option::Some(#vt_tokens),
                         init: #rhs,
                     }
                 })
             }
             Stmt::Item(item) => Err(Error::new_spanned(
                 item,
-                "nested item declarations (other than scalar `const`) are not supported in `#[gpu]` kernels",
+                "nested item declarations (other than `const`) are not supported in `#[gpu]` kernels",
             )),
             Stmt::Macro(mac) => Err(Error::new_spanned(
                 mac,
@@ -716,6 +985,10 @@ impl IrAstBuilder {
                         value: #rhs,
                     }
                 })
+            }
+            Expr::Call(_) if has_semi => {
+                let call_expr = self.lower_expr(expr)?;
+                Ok(quote! { ::sumeru::GpuStmt::Expr(#call_expr) })
             }
             Expr::If(expr_if) => {
                 let cond = self.lower_expr(&expr_if.cond)?;
@@ -757,6 +1030,16 @@ impl IrAstBuilder {
                         body: #body,
                     }
                 })
+            }
+            Expr::Loop(expr_loop) => {
+                if expr_loop.label.is_some() {
+                    return Err(Error::new_spanned(
+                        &expr_loop.label,
+                        "labeled `loop` is not supported in `#[gpu]` kernels",
+                    ));
+                }
+                let body = self.lower_block(&expr_loop.body)?;
+                Ok(quote! { ::sumeru::GpuStmt::Loop(#body) })
             }
             Expr::ForLoop(expr_for) => {
                 let Pat::Ident(pat_ident) = &*expr_for.pat else {
@@ -852,7 +1135,7 @@ impl IrAstBuilder {
                 }
                 Err(Error::new_spanned(
                     other,
-                    "unsupported statement in `#[gpu]` kernel; only assignments, local `let`, `if`/`else`, `while`, `for`, and `return;` are supported",
+                    "unsupported statement in `#[gpu]` kernel; only assignments, local `let`, helper calls, `if`/`else`, `while`, `loop`, `for`, and `return` are supported",
                 ))
             }
         }
@@ -913,6 +1196,48 @@ impl IrAstBuilder {
                 // External Rust `const` identifier or multi-segment path (e.g. `DT` or `std::f32::consts::PI`):
                 // evaluated at compile time by `rustc` via `GpuConstValue`.
                 Ok(quote! { ::sumeru::GpuConstValue::to_gpu_expr(&(#p)) })
+            }
+            Expr::Reference(expr_ref) => self.lower_expr(&expr_ref.expr),
+            Expr::Array(expr_arr) => {
+                if !(2..=4).contains(&expr_arr.elems.len()) {
+                    return Err(Error::new_spanned(
+                        expr_arr,
+                        "fixed-size array literals in `#[gpu]` functions must have between 2 and 4 elements",
+                    ));
+                }
+                let mut elems = Vec::with_capacity(expr_arr.elems.len());
+                for e in &expr_arr.elems {
+                    elems.push(self.lower_expr(e)?);
+                }
+                Ok(quote! { ::sumeru::GpuExpr::ArrayInit(::std::vec![ #(#elems),* ]) })
+            }
+            Expr::Repeat(expr_rep) => {
+                let Expr::Lit(el) = &*expr_rep.len else {
+                    return Err(Error::new_spanned(
+                        &expr_rep.len,
+                        "array repeat length in `#[gpu]` functions must be an integer literal (2..=4)",
+                    ));
+                };
+                let Lit::Int(il) = &el.lit else {
+                    return Err(Error::new_spanned(
+                        &expr_rep.len,
+                        "array repeat length in `#[gpu]` functions must be an integer literal (2..=4)",
+                    ));
+                };
+                let len: usize = il.base10_parse()?;
+                if !(2..=4).contains(&len) {
+                    return Err(Error::new_spanned(
+                        expr_rep,
+                        "array repeat length in `#[gpu]` functions must be between 2 and 4",
+                    ));
+                }
+                let elem = self.lower_expr(&expr_rep.expr)?;
+                Ok(quote! {
+                    ::sumeru::GpuExpr::ArrayRepeat {
+                        elem: ::std::boxed::Box::new(#elem),
+                        len: #len,
+                    }
+                })
             }
             Expr::Field(f) => {
                 let base = self.lower_expr(&f.base)?;
@@ -1027,11 +1352,24 @@ impl IrAstBuilder {
                     ("powf", 1) => quote! { ::sumeru::GpuMathIntrinsic::Powf },
                     ("clamp", 2) => quote! { ::sumeru::GpuMathIntrinsic::Clamp },
                     ("mul_add" | "fma", 2) => quote! { ::sumeru::GpuMathIntrinsic::Fma },
+                    ("dot", 1) => quote! { ::sumeru::GpuMathIntrinsic::Dot },
+                    ("length", 0) => quote! { ::sumeru::GpuMathIntrinsic::Length },
+                    ("length_squared", 0) => {
+                        return Ok(quote! {
+                            ::sumeru::GpuExpr::MathCall {
+                                receiver: ::std::boxed::Box::new(#receiver),
+                                intrinsic: ::sumeru::GpuMathIntrinsic::Dot,
+                                args: ::std::vec![ #receiver ],
+                            }
+                        });
+                    }
+                    ("normalize", 0) => quote! { ::sumeru::GpuMathIntrinsic::Normalize },
+                    ("distance", 1) => quote! { ::sumeru::GpuMathIntrinsic::Distance },
                     _ => {
                         return Err(Error::new_spanned(
                             &mc.method,
                             format!(
-                                "method `{method}` (with {} arg(s)) is not supported in `#[gpu]` kernels; supported methods: abs, sqrt, min, max, clamp, sin, cos, tan, floor, ceil, round, fract, exp, ln, powf, atan2, mul_add",
+                                "method `{method}` (with {} arg(s)) is not supported in `#[gpu]` kernels; supported methods: abs, sqrt, min, max, clamp, sin, cos, tan, floor, ceil, round, fract, exp, ln, powf, atan2, mul_add, dot, length, length_squared, normalize, distance",
                                 args.len()
                             ),
                         ));
@@ -1045,11 +1383,52 @@ impl IrAstBuilder {
                     }
                 })
             }
+            Expr::Struct(st) => {
+                let type_name = st
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let expected: &[&str] = match type_name.as_str() {
+                    "Vec2" => &["x", "y"],
+                    "Vec3" => &["x", "y", "z"],
+                    "Vec4" => &["x", "y", "z", "w"],
+                    _ => {
+                        return Err(Error::new_spanned(
+                            st,
+                            "only `Vec2`, `Vec3`, and `Vec4` struct literals are supported in `#[gpu]` / `#[kernel]` functions",
+                        ));
+                    }
+                };
+                if st.rest.is_some() {
+                    return Err(Error::new_spanned(
+                        st,
+                        "struct update syntax (`..rest`) is not supported in `#[gpu]` / `#[kernel]` functions",
+                    ));
+                }
+                let mut elems = Vec::with_capacity(expected.len());
+                for &comp in expected {
+                    let Some(fv) = st.fields.iter().find(|f| matches!(&f.member, Member::Named(id) if id == comp)) else {
+                        return Err(Error::new_spanned(
+                            st,
+                            format!("missing field `{comp}` in `{type_name}` literal"),
+                        ));
+                    };
+                    elems.push(self.lower_expr(&fv.expr)?);
+                }
+                Ok(quote! {
+                    ::sumeru::GpuExpr::VecConstruct {
+                        elem_ty: ::sumeru::GpuScalarKind::F32,
+                        elements: ::std::vec![ #(#elems),* ],
+                    }
+                })
+            }
             Expr::Call(call) => {
                 let Expr::Path(func_path) = &*call.func else {
                     return Err(Error::new_spanned(
                         &call.func,
-                        "only direct calls to `#[gpu]` pure helper functions are supported in `#[gpu]` kernels",
+                        "only direct calls to `#[gpu]` helper functions are supported in `#[gpu]` kernels",
                     ));
                 };
                 if func_path.qself.is_some() {
@@ -1057,12 +1436,113 @@ impl IrAstBuilder {
                         func_path,
                         "qualified `<T as Trait>::fn` calls are not supported in `#[gpu]` kernels",
                     ));
-                }
+                };
                 let mut args = Vec::with_capacity(call.args.len());
                 for arg in &call.args {
                     args.push(self.lower_expr(arg)?);
                 }
                 let path = &func_path.path;
+                if path.segments.len() >= 2 {
+                    let prev = path.segments[path.segments.len() - 2].ident.to_string();
+                    let last = path.segments.last().unwrap().ident.to_string();
+                    if matches!(prev.as_str(), "Vec2" | "Vec3" | "Vec4") {
+                        let expected_len: usize = match prev.as_str() {
+                            "Vec2" => 2,
+                            "Vec3" => 3,
+                            _ => 4,
+                        };
+                        match (last.as_str(), args.len()) {
+                            ("new", n) if n == expected_len => {
+                                return Ok(quote! {
+                                    ::sumeru::GpuExpr::VecConstruct {
+                                        elem_ty: ::sumeru::GpuScalarKind::F32,
+                                        elements: ::std::vec![ #(#args),* ],
+                                    }
+                                });
+                            }
+                            ("splat", 1) => {
+                                let a0 = &args[0];
+                                return Ok(quote! {
+                                    ::sumeru::GpuExpr::ArrayRepeat {
+                                        elem: ::std::boxed::Box::new(#a0),
+                                        len: #expected_len,
+                                    }
+                                });
+                            }
+                            ("from_array", 1) => {
+                                let a0 = &args[0];
+                                return Ok(quote! { #a0 });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if path.is_ident("vec2") {
+                    return Ok(quote! {
+                        ::sumeru::GpuExpr::VecConstruct {
+                            elem_ty: ::sumeru::GpuScalarKind::F32,
+                            elements: ::std::vec![ #(#args),* ],
+                        }
+                    });
+                }
+                if path.is_ident("vec3") {
+                    return Ok(quote! {
+                        ::sumeru::GpuExpr::VecConstruct {
+                            elem_ty: ::sumeru::GpuScalarKind::F32,
+                            elements: ::std::vec![ #(#args),* ],
+                        }
+                    });
+                }
+                if path.is_ident("vec4") {
+                    return Ok(quote! {
+                        ::sumeru::GpuExpr::VecConstruct {
+                            elem_ty: ::sumeru::GpuScalarKind::F32,
+                            elements: ::std::vec![ #(#args),* ],
+                        }
+                    });
+                }
+                if path.is_ident("dot") && args.len() == 2 {
+                    let a0 = &args[0];
+                    let a1 = &args[1];
+                    return Ok(quote! {
+                        ::sumeru::GpuExpr::MathCall {
+                            receiver: ::std::boxed::Box::new(#a0),
+                            intrinsic: ::sumeru::GpuMathIntrinsic::Dot,
+                            args: ::std::vec![ #a1 ],
+                        }
+                    });
+                }
+                if path.is_ident("length") && args.len() == 1 {
+                    let a0 = &args[0];
+                    return Ok(quote! {
+                        ::sumeru::GpuExpr::MathCall {
+                            receiver: ::std::boxed::Box::new(#a0),
+                            intrinsic: ::sumeru::GpuMathIntrinsic::Length,
+                            args: ::std::vec![],
+                        }
+                    });
+                }
+                if path.is_ident("normalize") && args.len() == 1 {
+                    let a0 = &args[0];
+                    return Ok(quote! {
+                        ::sumeru::GpuExpr::MathCall {
+                            receiver: ::std::boxed::Box::new(#a0),
+                            intrinsic: ::sumeru::GpuMathIntrinsic::Normalize,
+                            args: ::std::vec![],
+                        }
+                    });
+                }
+                if path.is_ident("distance") && args.len() == 2 {
+                    let a0 = &args[0];
+                    let a1 = &args[1];
+                    return Ok(quote! {
+                        ::sumeru::GpuExpr::MathCall {
+                            receiver: ::std::boxed::Box::new(#a0),
+                            intrinsic: ::sumeru::GpuMathIntrinsic::Distance,
+                            args: ::std::vec![ #a1 ],
+                        }
+                    });
+                }
                 Ok(quote! {
                     ::sumeru::GpuExpr::HelperCall {
                         helper: #path::gpu_helper_descriptor(),
@@ -1072,7 +1552,7 @@ impl IrAstBuilder {
             }
             other => Err(Error::new_spanned(
                 other,
-                "unsupported Rust expression in `#[gpu]` kernel; closures, `match`, and references are not permitted in GPU shaders",
+                "unsupported Rust expression in `#[gpu]` kernel; closures and `match` are not permitted in GPU shaders",
             )),
         }
     }

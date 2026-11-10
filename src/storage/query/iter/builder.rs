@@ -2,11 +2,11 @@ use super::*;
 
 #[must_use = "a query does no work until iterated"]
 pub struct QueryMutBuilder<'a, Q: QueryMutData<'a>, F: QueryFilter = All> {
-    archetypes: &'a mut [Archetype],
-    row_upper_bound: usize,
-    write_epoch: u64,
-    filter: F,
-    marker: PhantomData<Q>,
+    pub(crate) archetypes: &'a mut [Archetype],
+    pub(crate) row_upper_bound: usize,
+    pub(crate) write_epoch: u64,
+    pub(crate) filter: F,
+    pub(crate) marker: PhantomData<Q>,
 }
 
 impl<'a, Q: QueryMutData<'a>, F: QueryFilter> std::fmt::Debug for QueryMutBuilder<'a, Q, F> {
@@ -585,27 +585,33 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryGpuRunner<'a, Q, F> {
             });
         }
 
-        // 阶段 2：统一派发并提交列写纪元
+        // 阶段 2：单 CommandBuffer 批量合并派发并提交列写纪元
+        let scalar_args = kernel.scalar_uniform_words();
+        let batch_inputs: Vec<crate::storage::gpu::GpuArchetypeBatchInput> = prepared
+            .iter()
+            .map(|item| crate::storage::gpu::GpuArchetypeBatchInput {
+                archetype_id: item.arch_id,
+                active_rows: item.active_rows,
+                bindings: item.raw_bindings.clone(),
+            })
+            .collect();
+        let (hits, misses, submissions) = unsafe {
+            engine.dispatch_archetypes_batch_raw(desc, &batch_inputs, scalar_args)?
+        };
+
         let mut stats = crate::storage::gpu::GpuDispatchStats {
             execution_mode: engine.execution_mode(),
+            buffer_cache_hits: hits,
+            buffer_cache_misses: misses,
+            command_buffer_submissions: submissions,
             ..Default::default()
         };
         for item in prepared {
-            let (_grid, hits, misses) = unsafe {
-                engine.dispatch_archetype_raw(
-                    item.arch_id,
-                    item.active_rows,
-                    desc,
-                    &item.raw_bindings,
-                )?
-            };
             let archetype = &mut self.builder.archetypes[item.arch_idx];
             Q::mark_written_columns(archetype, None, self.builder.write_epoch);
             stats.dispatched_archetypes += 1;
             stats.total_rows += item.active_rows;
             stats.total_pages_16k += item.pages_16k;
-            stats.buffer_cache_hits += hits;
-            stats.buffer_cache_misses += misses;
         }
 
         Ok(stats)

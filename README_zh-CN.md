@@ -121,12 +121,14 @@ sumeru = { git = "https://github.com/XYCaptain/Sumeru.git" }
 
 - `flecs`（85 个场景）：动态列绑定、实体关系对、多阶段流水线、事件监听与反射序列化
 - `gpu`（13 个场景）：16KB 页对齐零拷贝 GPU 计算、强类型 Shader IR 与三层并行调度
+- `gpu_multi_kernel_pass`：统一 `#[kernel]` 算子、`Vec3` 向量运算、直接列视图元组解构与零气泡多 Kernel 计算通道
 
 ```bash
-cargo test                                    # 运行核心单元与开源安全边界测试
-cargo run --example flecs                     # 运行状态与关系建模示例集（85 个场景）
-cargo run --example gpu --features gpu        # 运行 16KB 零拷贝 GPU 异构计算示例集（13 个场景）
-cargo bench --bench store_benchmark           # 运行连续列存与查询吞吐基准测试
+cargo test                                              # 运行核心单元与开源安全边界测试
+cargo run --example flecs                               # 运行状态与关系建模示例集（85 个场景）
+cargo run --example gpu --features gpu                  # 运行 16KB 零拷贝 GPU 异构计算示例集（13 个场景）
+cargo run --example gpu_multi_kernel_pass --features gpu # 运行多 Kernel 零气泡 GPU 计算通道与 #[kernel] 演示
+cargo bench --bench store_benchmark                     # 运行连续列存与查询吞吐基准测试
 ```
 
 ## Architecture

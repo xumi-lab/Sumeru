@@ -15,8 +15,8 @@
 //!    通过持有底层列块的 `Arc` 引用，确保在外部引用存活期间 CPU 写操作自动触发写时复制 (COW) 隔离。
 
 use super::{
-    ColumnGpuMutView, ColumnGpuView, GpuColumnPin, GpuComponent, GpuDispatchUniforms,
-    GpuKernelDescriptor,
+    ColumnGpuMutView, ColumnGpuView, GpuColumnPin, GpuComponent, GpuCpuChunkRunner,
+    GpuDispatchUniforms, GpuKernelDescriptor,
 };
 use crate::error::StateError;
 use crate::id::{ArchetypeId, ComponentTypeId};
@@ -111,13 +111,13 @@ impl MetalNoCopyBufferDescriptor {
                 "Metal NoCopy buffer pointer cannot be null".into(),
             ));
         }
-        if (base_ptr as usize) % HARDWARE_PAGE_SIZE != 0 {
+        if !(base_ptr as usize).is_multiple_of(HARDWARE_PAGE_SIZE) {
             return Err(StateError::AccessDenied(format!(
                 "Metal NoCopy buffer pointer {:p} is not 16KB ({HARDWARE_PAGE_SIZE}B) page-aligned",
                 base_ptr
             )));
         }
-        if allocated_bytes == 0 || allocated_bytes % HARDWARE_PAGE_SIZE != 0 {
+        if allocated_bytes == 0 || !allocated_bytes.is_multiple_of(HARDWARE_PAGE_SIZE) {
             return Err(StateError::AccessDenied(format!(
                 "Metal NoCopy buffer length {allocated_bytes} is not a positive multiple of 16KB ({HARDWARE_PAGE_SIZE}B)"
             )));
@@ -209,29 +209,26 @@ impl MetalBufferCache {
     ) -> (CachedMetalBuffer, bool, Option<u64>) {
         let key = (archetype_id, component_id);
         let ptr_addr = desc.base_ptr as usize;
-        if let Some(existing) = self.entries.get(&key) {
-            if existing.base_ptr == ptr_addr
-                && existing.allocated_bytes == desc.allocated_bytes
-                && existing.generation == desc.generation
-            {
-                self.hits += 1;
-                return (existing.clone(), true, None);
-            }
+        if let Some(existing) = self.entries.get(&key)
+            && existing.base_ptr == ptr_addr
+            && existing.allocated_bytes == desc.allocated_bytes
+            && existing.generation == desc.generation
+        {
+            self.hits += 1;
+            return (existing.clone(), true, None);
         }
         let mut evicted_handle = None;
         if let Some(replaced) = self.entries.remove(&key) {
             evicted_handle = Some(replaced.handle_id);
-        } else if self.entries.len() >= self.max_entries {
-            if let Some(oldest_key) = self
+        } else if self.entries.len() >= self.max_entries
+            && let Some(oldest_key) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, v)| v.handle_id)
                 .map(|(k, _)| *k)
-            {
-                if let Some(removed) = self.entries.remove(&oldest_key) {
-                    evicted_handle = Some(removed.handle_id);
-                }
-            }
+            && let Some(removed) = self.entries.remove(&oldest_key)
+        {
+            evicted_handle = Some(removed.handle_id);
         }
         self.misses += 1;
         let handle_id = self.next_handle_id;
@@ -327,9 +324,7 @@ impl MetalThreadgroupDispatch {
                 total_grid_threads: 0,
             };
         }
-        let clamped_max = max_threads_per_group
-            .max(APPLE_SIMD_GROUP_WIDTH)
-            .min(1024);
+        let clamped_max = max_threads_per_group.clamp(APPLE_SIMD_GROUP_WIDTH, 1024);
         let aligned_group = (clamped_max / APPLE_SIMD_GROUP_WIDTH) * APPLE_SIMD_GROUP_WIDTH;
         let threads_per_threadgroup = if rows < aligned_group {
             (rows.saturating_add(APPLE_SIMD_GROUP_WIDTH - 1) / APPLE_SIMD_GROUP_WIDTH)
@@ -446,6 +441,12 @@ pub fn compile_and_validate_pipeline(
     let mut ep_resources = naga::back::msl::EntryPointResources::default();
     let total_bindings = descriptor.bindings().len() + 1;
     for idx in 0..total_bindings {
+        let is_mut = if idx < descriptor.bindings().len() {
+            let b = &descriptor.bindings()[idx];
+            b.mutable && super::kernel::is_param_written_in_source(b.param_name, wgsl_src)
+        } else {
+            false
+        };
         ep_resources.resources.insert(
             naga::ResourceBinding {
                 group: 0,
@@ -453,7 +454,7 @@ pub fn compile_and_validate_pipeline(
             },
             naga::back::msl::BindTarget {
                 buffer: Some(idx as u8),
-                mutable: idx < descriptor.bindings().len() && descriptor.bindings()[idx].mutable,
+                mutable: is_mut,
                 ..Default::default()
             },
         );
@@ -493,6 +494,97 @@ pub enum GpuExecutionMode {
     CpuFallback,
 }
 
+/// 单张 Archetype 在硬件批量命令缓冲区中的编码项。
+#[derive(Debug, Clone)]
+pub struct GpuHardwareBatchItem {
+    /// 该表的零拷贝 `MTLBuffer` 句柄列表
+    pub buffer_handles: Vec<u64>,
+    /// 该表的列原始指针列表（供 CPU fallback 或自定义驱动使用）
+    pub raw_ptrs: Vec<*mut u8>,
+    /// 活跃实体行数
+    pub active_rows: usize,
+    /// 1D 线程网格配置
+    pub grid: MetalThreadgroupDispatch,
+    /// 派发 Uniform 参数（含 `scalar_args`）
+    pub uniforms: GpuDispatchUniforms,
+}
+
+/// 传入 `MetalComputeEngine::dispatch_archetypes_batch_raw` 的单张 Archetype 预检绑定项。
+#[derive(Debug, Clone)]
+pub struct GpuArchetypeBatchInput {
+    /// 原型 ID
+    pub archetype_id: ArchetypeId,
+    /// 活跃实体行数
+    pub active_rows: usize,
+    /// 列绑定描述符列表
+    pub bindings: Vec<(ComponentTypeId, MetalNoCopyBufferDescriptor)>,
+}
+
+/// GPU 计算与命令通道执行错误
+#[derive(Debug, thiserror::Error)]
+pub enum GpuExecutionError {
+    #[error("Storage state error: {0}")]
+    State(#[from] StateError),
+
+    #[error("GPU hardware failure: {0}")]
+    HardwareFailure(String),
+
+    #[error("Pipeline error: {0}")]
+    PipelineError(String),
+
+    #[error("Pass encoding error: {0}")]
+    EncodingError(String),
+}
+
+impl From<GpuExecutionError> for StateError {
+    fn from(err: GpuExecutionError) -> Self {
+        match err {
+            GpuExecutionError::State(s) => s,
+            other => StateError::AccessDenied(other.to_string()),
+        }
+    }
+}
+
+/// 编译后的计算管线句柄（承载硬件 PSO 指针与 CPU 降级执行器）
+#[derive(Clone)]
+pub struct GpuPipelineHandle {
+    pub name: &'static str,
+    pub raw_pso: *mut std::ffi::c_void,
+    pub max_threads_per_threadgroup: u32,
+    pub cpu_runner: Option<GpuCpuChunkRunner>,
+}
+
+unsafe impl Send for GpuPipelineHandle {}
+unsafe impl Sync for GpuPipelineHandle {}
+
+impl std::fmt::Debug for GpuPipelineHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuPipelineHandle")
+            .field("name", &self.name)
+            .field("raw_pso", &self.raw_pso)
+            .field("max_threads_per_threadgroup", &self.max_threads_per_threadgroup)
+            .finish()
+    }
+}
+
+/// 多 Kernel 计算通道命令编码器契约
+pub trait GpuPassEncoder: std::fmt::Debug + Send {
+    /// 在当前计算通道内追加派发一个 Kernel 派发
+    fn encode_dispatch(
+        &mut self,
+        pipeline: &GpuPipelineHandle,
+        threadgroups: &MetalThreadgroupDispatch,
+        buffers: &[(*mut u8, usize)],
+        uniforms: &GpuDispatchUniforms,
+    ) -> Result<(), GpuExecutionError>;
+
+    /// 插入 GPU 显存屏障（`MTLBarrierScopeBuffers`）
+    fn memory_barrier(&mut self) -> Result<(), GpuExecutionError>;
+
+    /// 结束编码、提交命令缓冲区并单次等待完成
+    fn finish(self: Box<Self>) -> Result<(), GpuExecutionError>;
+}
+
 /// 底层 GPU 硬件计算驱动契约（如 macOS 原生 Metal 硬件驱动或外部注入的 Vulkan / WebGPU 硬件驱动）。
 pub trait GpuHardwareDriver: std::fmt::Debug + Send + Sync {
     /// 硬件设备名称（如 `"Apple M3 Max"`）。
@@ -500,6 +592,16 @@ pub trait GpuHardwareDriver: std::fmt::Debug + Send + Sync {
 
     /// 硬件是否支持 CPU/GPU 统一内存架构 (UMA)。
     fn has_unified_memory(&self) -> bool;
+
+    /// 获取指定名称的已编译原生 PSO 指针（若存在）
+    fn get_pipeline_pso(&self, _name: &'static str) -> Option<*mut std::ffi::c_void> {
+        None
+    }
+
+    /// 开启一个连续多 Kernel GPU 计算通道编码会话
+    fn begin_compute_pass(&mut self) -> Result<Box<dyn GpuPassEncoder>, GpuExecutionError> {
+        Ok(Box::new(CpuFallbackPassEncoder::default()))
+    }
 
     /// 在硬件设备上编译指定内核的 Compute Pipeline State，返回该管线支持的最大 Threadgroup 宽度。
     fn compile_pipeline(
@@ -534,6 +636,37 @@ pub trait GpuHardwareDriver: std::fmt::Debug + Send + Sync {
         grid: &MetalThreadgroupDispatch,
         uniforms: &GpuDispatchUniforms,
     ) -> Result<(), StateError>;
+
+    /// 在单个硬件 CommandBuffer 与 ComputeCommandEncoder 中批量编码并提交多张 Archetype 的 1D Compute 派发。
+    ///
+    /// 返回实际提交的硬件 CommandBuffer 数量（非空批次为 `1`，空批次为 `0`）。
+    ///
+    /// # Safety
+    /// 调用方必须保证 `items` 中每个条目的 `buffer_handles` 与 `raw_ptrs` 均与 `descriptor.bindings()` 一一对应且内存有效。
+    unsafe fn dispatch_compute_batch(
+        &mut self,
+        descriptor: &GpuKernelDescriptor,
+        items: &[GpuHardwareBatchItem],
+    ) -> Result<usize, StateError> {
+        let mut submitted = 0usize;
+        for item in items {
+            if item.active_rows == 0 {
+                continue;
+            }
+            unsafe {
+                self.dispatch_compute(
+                    descriptor,
+                    &item.buffer_handles,
+                    &item.raw_ptrs,
+                    item.active_rows,
+                    &item.grid,
+                    &item.uniforms,
+                )?;
+            }
+            submitted = 1;
+        }
+        Ok(submitted)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -550,10 +683,13 @@ mod macos_metal_driver {
     }
 
     #[link(name = "Metal", kind = "framework")]
+    unsafe extern "C" {
+        fn MTLCreateSystemDefaultDevice() -> *mut c_void;
+    }
+
     #[link(name = "Foundation", kind = "framework")]
     #[link(name = "objc")]
     unsafe extern "C" {
-        fn MTLCreateSystemDefaultDevice() -> *mut c_void;
         fn sel_registerName(name: *const c_char) -> *mut c_void;
         fn objc_getClass(name: *const c_char) -> *mut c_void;
         fn objc_msgSend();
@@ -595,7 +731,7 @@ mod macos_metal_driver {
 
     unsafe fn nsstring_from_str(s: &str) -> Option<*mut c_void> {
         let cstr = CString::new(s).ok()?;
-        let cls = unsafe { objc_getClass(b"NSString\0".as_ptr() as *const c_char) };
+        let cls = unsafe { objc_getClass(c"NSString".as_ptr()) };
         if cls.is_null() {
             return None;
         }
@@ -793,8 +929,7 @@ mod macos_metal_driver {
                 let max_threads_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize =
                     std::mem::transmute(objc_msgSend as *const ());
                 let max_threads = (max_threads_fn(pso, sel(b"maxTotalThreadsPerThreadgroup\0")) as u32)
-                    .max(APPLE_SIMD_GROUP_WIDTH)
-                    .min(DEFAULT_MAX_TOTAL_THREADS_PER_THREADGROUP);
+                    .clamp(APPLE_SIMD_GROUP_WIDTH, DEFAULT_MAX_TOTAL_THREADS_PER_THREADGROUP);
                 self.pipelines.insert(descriptor.name(), (pso, max_threads));
                 Ok(max_threads)
             }
@@ -953,6 +1088,356 @@ mod macos_metal_driver {
                 Ok(())
             }
         }
+
+        unsafe fn dispatch_compute_batch(
+            &mut self,
+            descriptor: &GpuKernelDescriptor,
+            items: &[GpuHardwareBatchItem],
+        ) -> Result<usize, StateError> {
+            if !items.iter().any(|item| item.active_rows > 0) {
+                return Ok(0);
+            }
+            let Some(&(pso, _)) = self.pipelines.get(descriptor.name()) else {
+                return Err(StateError::AccessDenied(format!(
+                    "Metal pipeline `{}` is not compiled",
+                    descriptor.name()
+                )));
+            };
+            unsafe {
+                let _pool = AutoreleasePool::new();
+                let cmd_buf_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let cmd_buf = cmd_buf_fn(self.command_queue, sel(b"commandBuffer\0"));
+                if cmd_buf.is_null() {
+                    return Err(StateError::AccessDenied(
+                        "Failed to create MTLCommandBuffer".into(),
+                    ));
+                }
+                let enc_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let encoder = enc_fn(cmd_buf, sel(b"computeCommandEncoder\0"));
+                if encoder.is_null() {
+                    return Err(StateError::AccessDenied(
+                        "Failed to create MTLComputeCommandEncoder".into(),
+                    ));
+                }
+
+                let set_pso_fn: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+                    std::mem::transmute(objc_msgSend as *const ());
+                set_pso_fn(encoder, sel(b"setComputePipelineState:\0"), pso);
+
+                let set_buf_fn: unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    usize,
+                    usize,
+                ) = std::mem::transmute(objc_msgSend as *const ());
+                let set_bytes_fn: unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *const c_void,
+                    usize,
+                    usize,
+                ) = std::mem::transmute(objc_msgSend as *const ());
+                let dispatch_fn: unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    MTLSize,
+                    MTLSize,
+                ) = std::mem::transmute(objc_msgSend as *const ());
+
+                for item in items {
+                    if item.active_rows == 0 {
+                        continue;
+                    }
+                    for (idx, handle_id) in item.buffer_handles.iter().enumerate() {
+                        let Some(&mtl_buf) = self.buffers.get(handle_id) else {
+                            let end_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+                                std::mem::transmute(objc_msgSend as *const ());
+                            end_fn(encoder, sel(b"endEncoding\0"));
+                            return Err(StateError::AccessDenied(format!(
+                                "Missing registered MTLBuffer for handle_id {handle_id}"
+                            )));
+                        };
+                        set_buf_fn(encoder, sel(b"setBuffer:offset:atIndex:\0"), mtl_buf, 0, idx);
+                    }
+
+                    set_bytes_fn(
+                        encoder,
+                        sel(b"setBytes:length:atIndex:\0"),
+                        &item.uniforms as *const GpuDispatchUniforms as *const c_void,
+                        std::mem::size_of::<GpuDispatchUniforms>(),
+                        item.buffer_handles.len(),
+                    );
+
+                    dispatch_fn(
+                        encoder,
+                        sel(b"dispatchThreadgroups:threadsPerThreadgroup:\0"),
+                        MTLSize {
+                            width: item.grid.threadgroup_count as usize,
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: item.grid.threads_per_threadgroup as usize,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
+
+                let void_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+                    std::mem::transmute(objc_msgSend as *const ());
+                void_fn(encoder, sel(b"endEncoding\0"));
+                void_fn(cmd_buf, sel(b"commit\0"));
+                void_fn(cmd_buf, sel(b"waitUntilCompleted\0"));
+
+                let status_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let status = status_fn(cmd_buf, sel(b"status\0"));
+                // MTLCommandBufferStatusCompleted == 4
+                if status != 4 {
+                    return Err(StateError::AccessDenied(format!(
+                        "MTLCommandBuffer execution failed with status {status}"
+                    )));
+                }
+                Ok(1)
+            }
+        }
+
+        fn get_pipeline_pso(&self, name: &'static str) -> Option<*mut c_void> {
+            self.pipelines.get(name).map(|&(pso, _)| pso)
+        }
+
+        fn begin_compute_pass(
+            &mut self,
+        ) -> Result<Box<dyn GpuPassEncoder>, GpuExecutionError> {
+            unsafe {
+                let pool = AutoreleasePool::new();
+                let cmd_buf_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let cmd_buf = cmd_buf_fn(self.command_queue, sel(b"commandBuffer\0"));
+                if cmd_buf.is_null() {
+                    return Err(GpuExecutionError::HardwareFailure(
+                        "Failed to create MTLCommandBuffer for compute pass".into(),
+                    ));
+                }
+                let enc_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let encoder = enc_fn(cmd_buf, sel(b"computeCommandEncoder\0"));
+                if encoder.is_null() {
+                    return Err(GpuExecutionError::HardwareFailure(
+                        "Failed to create MTLComputeCommandEncoder for compute pass".into(),
+                    ));
+                }
+
+                Ok(Box::new(MacOsMetalPassEncoder {
+                    device: self.device,
+                    cmd_buf,
+                    encoder,
+                    buffer_cache: HashMap::new(),
+                    created_buffers: Vec::new(),
+                    finished: false,
+                    _pool: pool,
+                }))
+            }
+        }
+    }
+
+    /// macOS 原生 Metal 多 Kernel 计算通道命令编码器
+    pub struct MacOsMetalPassEncoder {
+        device: *mut c_void,
+        cmd_buf: *mut c_void,
+        encoder: *mut c_void,
+        buffer_cache: HashMap<usize, *mut c_void>,
+        created_buffers: Vec<*mut c_void>,
+        finished: bool,
+        _pool: AutoreleasePool,
+    }
+
+    impl std::fmt::Debug for MacOsMetalPassEncoder {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MacOsMetalPassEncoder")
+                .field("cmd_buf", &self.cmd_buf)
+                .field("encoder", &self.encoder)
+                .field("created_buffers", &self.created_buffers.len())
+                .field("finished", &self.finished)
+                .finish()
+        }
+    }
+
+    unsafe impl Send for MacOsMetalPassEncoder {}
+
+    impl MacOsMetalPassEncoder {
+        unsafe fn get_or_create_buffer(
+            &mut self,
+            ptr: *mut u8,
+            len: usize,
+        ) -> Result<*mut c_void, GpuExecutionError> {
+            let key = ptr as usize;
+            if let Some(&buf) = self.buffer_cache.get(&key) {
+                return Ok(buf);
+            }
+            unsafe {
+                let new_buf_fn: unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    usize,
+                    u64,
+                    *mut c_void,
+                ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+                let mtl_buf = new_buf_fn(
+                    self.device,
+                    sel(b"newBufferWithBytesNoCopy:length:options:deallocator:\0"),
+                    ptr as *mut c_void,
+                    len,
+                    0, // MTLResourceStorageModeShared = 0
+                    std::ptr::null_mut(),
+                );
+                if mtl_buf.is_null() {
+                    return Err(GpuExecutionError::HardwareFailure(format!(
+                        "Failed to create zero-copy MTLBuffer for pointer {:p} with length {len}",
+                        ptr
+                    )));
+                }
+                self.created_buffers.push(mtl_buf);
+                self.buffer_cache.insert(key, mtl_buf);
+                Ok(mtl_buf)
+            }
+        }
+    }
+
+    impl GpuPassEncoder for MacOsMetalPassEncoder {
+        fn encode_dispatch(
+            &mut self,
+            pipeline: &GpuPipelineHandle,
+            threadgroups: &MetalThreadgroupDispatch,
+            buffers: &[(*mut u8, usize)],
+            uniforms: &GpuDispatchUniforms,
+        ) -> Result<(), GpuExecutionError> {
+            if threadgroups.active_rows == 0 || threadgroups.threadgroup_count == 0 {
+                return Ok(());
+            }
+            if pipeline.raw_pso.is_null() {
+                return Err(GpuExecutionError::PipelineError(format!(
+                    "Metal pipeline `{}` has null PSO",
+                    pipeline.name
+                )));
+            }
+            unsafe {
+                let set_pso_fn: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+                    std::mem::transmute(objc_msgSend as *const ());
+                set_pso_fn(
+                    self.encoder,
+                    sel(b"setComputePipelineState:\0"),
+                    pipeline.raw_pso,
+                );
+
+                let set_buf_fn: unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    usize,
+                    usize,
+                ) = std::mem::transmute(objc_msgSend as *const ());
+
+                for (idx, &(ptr, len)) in buffers.iter().enumerate() {
+                    let mtl_buf = self.get_or_create_buffer(ptr, len)?;
+                    set_buf_fn(self.encoder, sel(b"setBuffer:offset:atIndex:\0"), mtl_buf, 0, idx);
+                }
+
+                let set_bytes_fn: unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *const c_void,
+                    usize,
+                    usize,
+                ) = std::mem::transmute(objc_msgSend as *const ());
+                set_bytes_fn(
+                    self.encoder,
+                    sel(b"setBytes:length:atIndex:\0"),
+                    uniforms as *const GpuDispatchUniforms as *const c_void,
+                    std::mem::size_of::<GpuDispatchUniforms>(),
+                    buffers.len(),
+                );
+
+                let dispatch_fn: unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    MTLSize,
+                    MTLSize,
+                ) = std::mem::transmute(objc_msgSend as *const ());
+                dispatch_fn(
+                    self.encoder,
+                    sel(b"dispatchThreadgroups:threadsPerThreadgroup:\0"),
+                    MTLSize {
+                        width: threadgroups.threadgroup_count as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: threadgroups.threads_per_threadgroup as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+
+                Ok(())
+            }
+        }
+
+        fn memory_barrier(&mut self) -> Result<(), GpuExecutionError> {
+            unsafe {
+                let void_fn_usize: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) =
+                    std::mem::transmute(objc_msgSend as *const ());
+                // MTLBarrierScopeBuffers = 1 << 0 = 1
+                void_fn_usize(self.encoder, sel(b"memoryBarrierWithScope:\0"), 1);
+                Ok(())
+            }
+        }
+
+        fn finish(mut self: Box<Self>) -> Result<(), GpuExecutionError> {
+            unsafe {
+                let void_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+                    std::mem::transmute(objc_msgSend as *const ());
+                void_fn(self.encoder, sel(b"endEncoding\0"));
+                void_fn(self.cmd_buf, sel(b"commit\0"));
+                void_fn(self.cmd_buf, sel(b"waitUntilCompleted\0"));
+                self.finished = true;
+
+                let status_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let status = status_fn(self.cmd_buf, sel(b"status\0"));
+                // MTLCommandBufferStatusCompleted == 4
+                if status != 4 {
+                    return Err(GpuExecutionError::HardwareFailure(format!(
+                        "MTLCommandBuffer execution failed with status {status}"
+                    )));
+                }
+
+                for buf in self.created_buffers.drain(..) {
+                    objc_release(buf);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for MacOsMetalPassEncoder {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.finished && !self.encoder.is_null() {
+                    let void_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+                        std::mem::transmute(objc_msgSend as *const ());
+                    void_fn(self.encoder, sel(b"endEncoding\0"));
+                }
+                for buf in self.created_buffers.drain(..) {
+                    objc_release(buf);
+                }
+            }
+        }
     }
 
     impl Drop for MacOsMetalDriver {
@@ -968,6 +1453,101 @@ mod macos_metal_driver {
                 objc_release(self.device);
             }
         }
+    }
+}
+
+/// 无硬件 GPU 时的 CPU 回退驱动
+#[derive(Debug, Default)]
+pub struct CpuFallbackDriver;
+
+impl GpuHardwareDriver for CpuFallbackDriver {
+    fn device_name(&self) -> &str {
+        "Sumeru CPU Fallback Driver"
+    }
+
+    fn has_unified_memory(&self) -> bool {
+        true
+    }
+
+    fn compile_pipeline(
+        &mut self,
+        _descriptor: &GpuKernelDescriptor,
+        _compiled: &MetalCompiledPipeline,
+    ) -> Result<u32, StateError> {
+        Ok(256)
+    }
+
+    unsafe fn register_no_copy_buffer(
+        &mut self,
+        _handle_id: u64,
+        _desc: &MetalNoCopyBufferDescriptor,
+    ) -> Result<(), StateError> {
+        Ok(())
+    }
+
+    fn unregister_buffer(&mut self, _handle_id: u64) {}
+
+    unsafe fn dispatch_compute(
+        &mut self,
+        descriptor: &GpuKernelDescriptor,
+        _buffer_handles: &[u64],
+        raw_ptrs: &[*mut u8],
+        active_rows: usize,
+        _grid: &MetalThreadgroupDispatch,
+        uniforms: &GpuDispatchUniforms,
+    ) -> Result<(), StateError> {
+        if active_rows > 0 {
+            unsafe {
+                (descriptor.cpu_runner())(raw_ptrs, active_rows, uniforms);
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_compute_pass(&mut self) -> Result<Box<dyn GpuPassEncoder>, GpuExecutionError> {
+        Ok(Box::new(CpuFallbackPassEncoder::default()))
+    }
+}
+
+/// CPU 回退计算通道编码器
+#[derive(Debug, Default)]
+pub struct CpuFallbackPassEncoder {
+    pub dispatches: usize,
+}
+
+impl GpuPassEncoder for CpuFallbackPassEncoder {
+    fn encode_dispatch(
+        &mut self,
+        pipeline: &GpuPipelineHandle,
+        _threadgroups: &MetalThreadgroupDispatch,
+        buffers: &[(*mut u8, usize)],
+        uniforms: &GpuDispatchUniforms,
+    ) -> Result<(), GpuExecutionError> {
+        let active_rows = uniforms.active_rows as usize;
+        if active_rows == 0 {
+            return Ok(());
+        }
+        let runner = pipeline.cpu_runner.as_ref().ok_or_else(|| {
+            GpuExecutionError::PipelineError(format!(
+                "No CPU fallback runner available for pipeline `{}`",
+                pipeline.name
+            ))
+        })?;
+        let raw_ptrs: Vec<*mut u8> = buffers.iter().map(|&(p, _)| p).collect();
+        unsafe {
+            runner(&raw_ptrs, active_rows, uniforms);
+        }
+        self.dispatches += 1;
+        Ok(())
+    }
+
+    fn memory_barrier(&mut self) -> Result<(), GpuExecutionError> {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), GpuExecutionError> {
+        Ok(())
     }
 }
 
@@ -1001,6 +1581,10 @@ pub struct GpuDispatchStats {
     pub buffer_cache_misses: usize,
     /// 本次派发实际采用的执行模式（`HardwareGpu` 真实硬件执行或 `CpuFallback` 无硬件回退）
     pub execution_mode: GpuExecutionMode,
+    /// 实际向 GPU 硬件提交的 CommandBuffer 次数（多表合并派发在单次查询中固定为 1，空查询或 CPU Fallback 为 0）
+    pub command_buffer_submissions: usize,
+    /// 多算子计算通道中根据读写冲突自动插入或手动插入的显存屏障 (`MTLBarrierScopeBuffers`) 数量
+    pub barriers_inserted: usize,
 }
 
 /// Metal / 跨平台 16KB 页对齐计算引擎（管理硬件 GPU 驱动探测、Naga Pipeline 编译验证缓存、`MTLBuffer` 零拷贝句柄缓存与计算派发）。
@@ -1150,6 +1734,37 @@ impl MetalComputeEngine {
             .expect("GPU kernel shader failed Naga WGSL/MSL compilation and validation")
     }
 
+    /// 获取指定内核的编译管线句柄（包含硬件 PSO 与 CPU 降级执行器）。
+    pub fn get_pipeline_handle(
+        &mut self,
+        descriptor: &GpuKernelDescriptor,
+    ) -> Result<GpuPipelineHandle, GpuExecutionError> {
+        let compiled = self.ensure_pipeline_compiled(descriptor)?;
+        let max_threads = compiled.max_threads_per_threadgroup;
+        let raw_pso = self
+            .driver
+            .as_ref()
+            .and_then(|d| d.get_pipeline_pso(descriptor.name()))
+            .unwrap_or(std::ptr::null_mut());
+
+        Ok(GpuPipelineHandle {
+            name: descriptor.name(),
+            raw_pso,
+            max_threads_per_threadgroup: max_threads,
+            cpu_runner: Some(descriptor.cpu_runner()),
+        })
+    }
+
+    /// 开启一个连续多 Kernel GPU 计算通道编码会话 (`GpuPassEncoder`)。
+    pub fn begin_compute_pass(
+        &mut self,
+    ) -> Result<Box<dyn GpuPassEncoder>, GpuExecutionError> {
+        match &mut self.driver {
+            Some(driver) => driver.begin_compute_pass(),
+            None => Ok(Box::new(CpuFallbackPassEncoder::default())),
+        }
+    }
+
     /// 分配新的生命周期守卫命令票据。
     #[inline]
     pub fn next_command_ticket(&mut self) -> MetalAsyncCommandTicket {
@@ -1186,22 +1801,21 @@ impl MetalComputeEngine {
             let (entry, hit, evicted) =
                 self.buffer_cache
                     .get_or_insert_with_evicted(archetype_id, *cid, buf_desc);
-            if let Some(evicted_id) = evicted {
-                if let Some(driver) = &mut self.driver {
-                    driver.unregister_buffer(evicted_id);
-                }
+            if let Some(evicted_id) = evicted
+                && let Some(driver) = &mut self.driver
+            {
+                driver.unregister_buffer(evicted_id);
             }
             if hit {
                 hits += 1;
             } else {
                 misses += 1;
-                if let Some(driver) = &mut self.driver {
-                    if let Err(err) =
+                if let Some(driver) = &mut self.driver
+                    && let Err(err) =
                         unsafe { driver.register_no_copy_buffer(entry.handle_id, buf_desc) }
-                    {
-                        self.buffer_cache.remove_entry(archetype_id, *cid);
-                        return Err(err);
-                    }
+                {
+                    self.buffer_cache.remove_entry(archetype_id, *cid);
+                    return Err(err);
                 }
             }
             buffer_handles.push(entry.handle_id);
@@ -1213,6 +1827,7 @@ impl MetalComputeEngine {
             threads_per_group: dispatch.threads_per_threadgroup,
             archetype_id: archetype_id.0,
             _pad: 0,
+            scalar_args: [0; 4],
         };
 
         if active_rows > 0 {
@@ -1234,6 +1849,100 @@ impl MetalComputeEngine {
         }
         self.total_dispatches += 1;
         Ok((dispatch, hits, misses))
+    }
+
+    /// 在单个硬件 CommandBuffer 与 ComputeCommandEncoder 中对多张 Archetype 的 16KB 页对齐列缓冲区集合执行批量零拷贝绑定与 Compute 派发。
+    ///
+    /// 返回 `Ok((total_hits, total_misses, command_buffer_submissions))`。
+    ///
+    /// # Safety
+    /// 调用方必须保证 `inputs` 中每张表的 `bindings` 与 `descriptor.bindings()` 一一对应，且可变绑定具有独占访问权。
+    pub unsafe fn dispatch_archetypes_batch_raw(
+        &mut self,
+        descriptor: &GpuKernelDescriptor,
+        inputs: &[GpuArchetypeBatchInput],
+        scalar_args: [u32; 4],
+    ) -> Result<(usize, usize, usize), StateError> {
+        let max_threads = self
+            .ensure_pipeline_compiled(descriptor)?
+            .max_threads_per_threadgroup;
+        if inputs.is_empty() {
+            return Ok((0, 0, 0));
+        }
+
+        let mut total_hits = 0usize;
+        let mut total_misses = 0usize;
+        let mut batch_items = Vec::with_capacity(inputs.len());
+
+        for input in inputs {
+            let dispatch = MetalThreadgroupDispatch::compute_1d(input.active_rows, max_threads);
+            let mut ptrs: Vec<*mut u8> = Vec::with_capacity(input.bindings.len());
+            let mut buffer_handles: Vec<u64> = Vec::with_capacity(input.bindings.len());
+
+            for (cid, buf_desc) in &input.bindings {
+                let (entry, hit, evicted) = self.buffer_cache.get_or_insert_with_evicted(
+                    input.archetype_id,
+                    *cid,
+                    buf_desc,
+                );
+                if let Some(evicted_id) = evicted
+                    && let Some(driver) = &mut self.driver
+                {
+                    driver.unregister_buffer(evicted_id);
+                }
+                if hit {
+                    total_hits += 1;
+                } else {
+                    total_misses += 1;
+                    if let Some(driver) = &mut self.driver
+                        && let Err(err) =
+                            unsafe { driver.register_no_copy_buffer(entry.handle_id, buf_desc) }
+                    {
+                        self.buffer_cache.remove_entry(input.archetype_id, *cid);
+                        return Err(err);
+                    }
+                }
+                buffer_handles.push(entry.handle_id);
+                ptrs.push(buf_desc.base_ptr);
+            }
+
+            let uniforms = GpuDispatchUniforms {
+                active_rows: dispatch.active_rows,
+                threads_per_group: dispatch.threads_per_threadgroup,
+                archetype_id: input.archetype_id.0,
+                _pad: 0,
+                scalar_args,
+            };
+
+            batch_items.push(GpuHardwareBatchItem {
+                buffer_handles,
+                raw_ptrs: ptrs,
+                active_rows: input.active_rows,
+                grid: dispatch,
+                uniforms,
+            });
+        }
+
+        let submissions = match &mut self.driver {
+            Some(driver) => unsafe { driver.dispatch_compute_batch(descriptor, &batch_items)? },
+            None => {
+                for item in &batch_items {
+                    if item.active_rows > 0 {
+                        unsafe {
+                            (descriptor.cpu_runner())(
+                                &item.raw_ptrs,
+                                item.active_rows,
+                                &item.uniforms,
+                            );
+                        }
+                    }
+                }
+                0
+            }
+        };
+
+        self.total_dispatches += batch_items.len() as u64;
+        Ok((total_hits, total_misses, submissions))
     }
 }
 

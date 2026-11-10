@@ -1,4 +1,4 @@
-//! 异构计算通道与多模式内核调度流水线 (GpuComputePass & GpuDispatchReceipt)
+//! 异构谓词掩码计算通道与多模式内核调度流水线 (GpuMaskedPass & GpuDispatchReceipt)
 //!
 //! 将 CPU 侧的 **倒排位图索引 (`ArchetypeBitSet`)**、**非迁移行级位平面 (`RowFlags`)**、
 //! **关系二级位图索引 (`PairTargetIndex`)**、**64 行块增量纪元 (`ChangedSince`)** 与
@@ -171,7 +171,7 @@ impl PairTargetGpuLut {
 /// 表内行级位图动态过滤器闭包
 type ArchetypeRowMaskFilter = Box<dyn Fn(&Archetype, &mut RowBitMask) -> bool + Send + Sync>;
 
-/// 单张原型表在一次 `GpuComputePass` 中的调度遥测与脏页增量清单
+/// 单张原型表在一次 `GpuMaskedPass` 中的调度遥测与脏页增量清单
 #[derive(Debug, Clone)]
 pub struct ArchetypeDispatchStats {
     pub archetype_id: u32,
@@ -184,7 +184,7 @@ pub struct ArchetypeDispatchStats {
     pub total_column_page_bytes: usize,
 }
 
-/// `GpuComputePass` 执行完成后的异构调度收据
+/// `GpuMaskedPass` 执行完成后的异构调度收据
 #[derive(Debug, Clone, Default)]
 pub struct GpuDispatchReceipt {
     pub store_epoch: u64,
@@ -210,7 +210,7 @@ impl GpuDispatchReceipt {
     }
 }
 
-/// 异构计算通道构建器与执行器 (`GpuComputePass`)
+/// 异构谓词掩码计算通道构建器与执行器 (`GpuMaskedPass`)
 ///
 /// 支持叠加：
 /// - `with_flag::<FLAG>()` / `without_flag::<FLAG>()`：行级非迁移位平面硬件掩码过滤；
@@ -218,7 +218,7 @@ impl GpuDispatchReceipt {
 /// - `changed_since::<T>(since_epoch)`：基于 64 行物理块纪元的整块剪枝；
 /// - 点对点行并行（Point-wise）、跨行关系目标收集（Relational Gather）、
 ///   跨行散射累加（Relational Scatter-Reduce）以及双精度 `f64` 归约（Threadgroup Reduction）。
-pub struct GpuComputePass {
+pub struct GpuMaskedPass {
     workgroup_size: u32,
     page_size: usize,
     required_flags: Vec<u8>,
@@ -227,13 +227,13 @@ pub struct GpuComputePass {
     custom_mask_filters: Vec<ArchetypeRowMaskFilter>,
 }
 
-impl Default for GpuComputePass {
+impl Default for GpuMaskedPass {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl GpuComputePass {
+impl GpuMaskedPass {
     /// 创建默认配置（`workgroup_size = 64`，硬件页粒度 `16KB`）的异构计算通道
     pub fn new() -> Self {
         Self {
@@ -910,7 +910,7 @@ mod tests {
         }
 
         let epoch_before_gpu = store.epoch();
-        let pass = GpuComputePass::new().with_flag::<0>();
+        let pass = GpuMaskedPass::new().with_flag::<0>();
         let receipt = pass
             .dispatch_binary_in_place::<Pos3D, Vel3D, _>(&mut store, |_row, pos, vel| {
                 pos.x += vel.vx;
@@ -968,7 +968,7 @@ mod tests {
                 .unwrap();
         }
 
-        let pass = GpuComputePass::new();
+        let pass = GpuMaskedPass::new();
         let gather_receipt = pass
             .dispatch_pair_gather::<AttachedTo, Pos3D, Pos3D, _>(
                 &mut store,

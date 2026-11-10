@@ -945,21 +945,29 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
             });
         }
 
-        // 阶段 2：推进 Store 全局纪元，执行派发并标记写入列的 64 行块纪元
+        // 阶段 2：推进 Store 全局纪元，执行单 CommandBuffer 批量合并派发并标记写入列的 64 行块纪元
+        let scalar_args = kernel.scalar_uniform_words();
+        let batch_inputs: Vec<crate::storage::gpu::GpuArchetypeBatchInput> = prepared
+            .iter()
+            .map(|item| crate::storage::gpu::GpuArchetypeBatchInput {
+                archetype_id: item.arch_id,
+                active_rows: item.active_rows,
+                bindings: item.raw_bindings.clone(),
+            })
+            .collect();
         store.bump_epoch();
+        let (hits, misses, submissions) = unsafe {
+            engine.dispatch_archetypes_batch_raw(desc, &batch_inputs, scalar_args)?
+        };
+
         let mut stats = crate::storage::gpu::GpuDispatchStats {
             execution_mode: engine.execution_mode(),
+            buffer_cache_hits: hits,
+            buffer_cache_misses: misses,
+            command_buffer_submissions: submissions,
             ..Default::default()
         };
         for item in prepared {
-            let (_grid, hits, misses) = unsafe {
-                engine.dispatch_archetype_raw(
-                    item.arch_id,
-                    item.active_rows,
-                    desc,
-                    &item.raw_bindings,
-                )?
-            };
             let archetype = &mut store.archetypes[item.arch_idx];
             <Q as super::spec::sealed::FetchMut<'static>>::mark_written_columns(
                 archetype,
@@ -969,8 +977,6 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
             stats.dispatched_archetypes += 1;
             stats.total_rows += item.active_rows;
             stats.total_pages_16k += item.pages_16k;
-            stats.buffer_cache_hits += hits;
-            stats.buffer_cache_misses += misses;
         }
 
         Ok(stats)

@@ -2,10 +2,10 @@ use super::*;
 
 #[must_use = "a query does no work until iterated"]
 pub struct SelectBuilder<'a, Q: QueryData<'a>, F: QueryFilter = All> {
-    archetypes: &'a [Archetype],
-    row_upper_bound: usize,
-    filter: F,
-    marker: PhantomData<Q>,
+    pub(crate) archetypes: &'a [Archetype],
+    pub(crate) row_upper_bound: usize,
+    pub(crate) filter: F,
+    pub(crate) marker: PhantomData<Q>,
 }
 
 impl<'a, Q: QueryData<'a>, F: QueryFilter> std::fmt::Debug for SelectBuilder<'a, Q, F> {

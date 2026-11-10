@@ -121,12 +121,14 @@ Run the built-in example suites with `cargo run --example <name>`:
 
 - `flecs` (85 scenarios): Dynamic column bindings, relational pairs, multi-phase pipelines, observers, and reflection
 - `gpu` (13 scenarios): 16KB page-aligned zero-copy GPU compute, typed Shader IR, and three-tier parallel dispatch
+- `gpu_multi_kernel_pass`: Ergonomic `#[kernel]` operators, `Vec3` math, direct tuple queries, and zero-bubble multi-kernel compute pipeline
 
 ```bash
-cargo test                                    # Run unit, integration, and security gate tests
-cargo run --example flecs                     # Run state & relational modeling examples (85 scenarios)
-cargo run --example gpu --features gpu        # Run 16KB zero-copy GPU compute examples (13 scenarios)
-cargo bench --bench store_benchmark           # Run contiguous columnar throughput benchmarks
+cargo test                                              # Run unit, integration, and security gate tests
+cargo run --example flecs                               # Run state & relational modeling examples (85 scenarios)
+cargo run --example gpu --features gpu                  # Run 16KB zero-copy GPU compute examples (13 scenarios)
+cargo run --example gpu_multi_kernel_pass --features gpu # Run multi-kernel GPU pipeline & #[kernel] showcase
+cargo bench --bench store_benchmark                     # Run contiguous columnar throughput benchmarks
 ```
 
 ## Architecture

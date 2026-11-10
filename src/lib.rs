@@ -23,11 +23,18 @@ pub use binding::*;
 pub use context::*;
 pub use error::*;
 pub use id::*;
-pub use schedule::*;
+pub use schedule::{
+    exclusive_system, par_chunk_query_system, par_query_system, query_system,
+    simple_par_chunk_query_system, simple_par_query_system, simple_query_system, AccessDescriptor,
+    AmbiguityDetector, AmbiguityPair, Commands, ConflictMatrix, DependencyConfig,
+    ExclusiveFunctionSystem, ExclusiveMarker, IntoSystem, ParChunkQuerySystem, ParQuerySystem,
+    ParallelJob, PrepareContext, QueryMarker, QuerySystem, Schedule, ScheduleGraph, System,
+    SystemConfigHandle, SystemId, SystemStage,
+};
 pub use schema::*;
 pub use storage::*;
 #[cfg(feature = "gpu")]
-pub use sumeru_macros::{gpu, gpu_component, gpu_kernel, GpuComponent, GpuShaderStruct};
+pub use sumeru_macros::{gpu, gpu_component, gpu_kernel, kernel, GpuComponent, GpuShaderStruct};
 
 #[doc(hidden)]
 pub mod __private {
